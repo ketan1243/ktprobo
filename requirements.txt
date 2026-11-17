@@ -2,8 +2,8 @@ python-telegram-bot[job-queue]>=20
 smartapi-python
 pyotp
 pandas
+numpy
 requests
 logzero
 websocket-client
 python-dotenv
-matplotlib
