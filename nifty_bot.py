@@ -379,8 +379,11 @@ def place_order(opt, side, qty) -> str:
 
 # ----------------------------- PERSISTENCE ----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")        # restart par state pacho aave
-HISTORY_FILE = os.path.join(BASE_DIR, "trades_history.csv")  # badha divas na trades (kayam)
+# Railway Volume vapro to Variables ma DATA_DIR=/data set karo (files tya save thase, deploy par delete nahi thay)
+DATA_DIR = os.getenv("DATA_DIR", BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")        # restart par state pacho aave
+HISTORY_FILE = os.path.join(DATA_DIR, "trades_history.csv")  # badha divas na trades (kayam)
 HISTORY_COLS = ["date", "entry_time", "exit_time", "duration_min", "mode", "strategy", "timeframe", "type",
                 "expiry", "lots", "qty", "entry_spot", "exit_spot",
                 "sell_symbol", "sell_entry", "sell_exit", "sell_pnl",
