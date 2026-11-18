@@ -158,24 +158,63 @@ _candle_cache = {"df": None}
 _last_err = {"msg": "", "t": 0.0}
 
 
+_login_lock = threading.RLock()
+_last_login = [0.0]
+SESSION_ERR_KEYS = ("ag8001", "ag8002", "ag8003", "invalid token", "token expired",
+                    "session expired", "unauthor", "invalid session")
+
+
+def _is_session_error(x) -> bool:
+    """Exception text ke API response dict ma token/session expiry error che?"""
+    if isinstance(x, dict):
+        if x.get("status") in (True, "true", "True"):
+            return False
+        x = f"{x.get('errorCode', '')} {x.get('message', '')}"
+    low = str(x).lower()
+    return any(k in low for k in SESSION_ERR_KEYS)
+
+
+def relogin(force=False):
+    """Thread-safe relogin. 20 sec ma ek j vaar (bija thread e hamna j karyu hoy to skip)."""
+    with _login_lock:
+        if not force and time.time() - _last_login[0] < 20:
+            return
+        angel_login()
+
+
 def throttled(fn, *args, retries=3, **kwargs):
-    """Angel API call: gap rakhe ane 'access rate' error par retry kare."""
-    for attempt in range(retries + 1):
+    """Angel API call: gap rakhe, 'access rate' par retry kare, ane Invalid Token (AG8001)
+    aave to automatic relogin karine pacho call kare."""
+    name = getattr(fn, "__name__", None)
+    relogged = False
+    for attempt in range(retries + 2):
         with _api_lock:
             wait = MIN_GAP - (time.time() - _last_call[0])
             if wait > 0:
                 time.sleep(wait)
             try:
-                return fn(*args, **kwargs)
+                # hamesha latest `smart` object vapro (relogin pachi navo object bane che)
+                call = getattr(smart, name) if (name and hasattr(smart, name)) else fn
+                res = call(*args, **kwargs)
+                err = _is_session_error(res) if isinstance(res, dict) else False
+                exc = None
             except Exception as e:
-                if "rate" in str(e).lower() and attempt < retries:
-                    log.warning("Rate limit, retry %d", attempt + 1)
-                    _last_call[0] = time.time()
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise
+                res, err, exc = None, _is_session_error(e), e
             finally:
                 _last_call[0] = time.time()
+        if err and not relogged:
+            log.warning("Session/token error (%s) -> relogin", exc or res)
+            relogged = True
+            relogin(force=True)
+            continue
+        if exc is not None:
+            if "rate" in str(exc).lower() and attempt < retries:
+                log.warning("Rate limit, retry %d", attempt + 1)
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise exc
+        return res
+    return res
 
 
 # ----------------------------- ANGEL HELPERS --------------------------
@@ -203,17 +242,35 @@ def check_env():
 def angel_login():
     global smart
     check_env()
-    smart = SmartConnect(api_key=ANGEL_API_KEY)
-    totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
-    data = smart.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp)
-    if not data.get("status"):
-        raise RuntimeError(f"Angel login failed: {data}")
-    AUTH["jwt"] = data["data"]["jwtToken"]
-    try:
-        AUTH["feed"] = smart.getfeedToken()
-    except Exception as e:
-        log.warning("feed token nathi malyo: %s", e)
-    log.info("Angel login OK")
+    last = None
+    for i in range(3):
+        try:
+            s_ = SmartConnect(api_key=ANGEL_API_KEY)
+            totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+            data = s_.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp)
+            if not data.get("status"):
+                raise RuntimeError(f"Angel login failed: {data}")
+            smart = s_
+            AUTH["jwt"] = data["data"]["jwtToken"]
+            try:
+                AUTH["feed"] = smart.getfeedToken()
+            except Exception as e:
+                log.warning("feed token nathi malyo: %s", e)
+            _last_login[0] = time.time()
+            log.info("Angel login OK")
+            # websocket ne navo token male e mate junu connection band karo (thread auto reconnect kare che)
+            try:
+                sws = ws_ctl.get("sws")
+                if sws and ws_ctl.get("open"):
+                    sws.close_connection()
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            last = e
+            log.warning("Angel login try %d failed: %s", i + 1, e)
+            time.sleep(3)      # TOTP navo code mate thodi vaar ruko
+    raise RuntimeError(f"Angel login failed after retries: {last}")
 
 
 def load_scrips():
@@ -875,6 +932,12 @@ def roll_day():
 
 async def tick(context: ContextTypes.DEFAULT_TYPE):
     roll_day()
+    # Angel JWT roughly 1 divas ma expire thay -> har 6 kalak ma fresh login (market time pehla pan)
+    if time.time() - _last_login[0] > 6 * 3600:
+        try:
+            await asyncio.to_thread(relogin, True)
+        except Exception as e:
+            log.warning("periodic relogin failed: %s", e)
     if not state["running"]:
         return
     app = context.application
