@@ -37,7 +37,7 @@ try:
     from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 except Exception:   # lib ma na hoy to REST fallback
     SmartWebSocketV2 = None
-from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup, InputMediaPhoto,
+from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
                       MenuButtonCommands, Update)
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
@@ -127,8 +127,6 @@ ANGEL_MAX_DAYS = {1: 30, 3: 60, 5: 100, 10: 100, 15: 200, 30: 200}     # Angel O
 HISTORY_PRESETS = [2, 3, 5, 6, 8, 10, 15, 20, 30, 45, 60, 100, 200]
 LOOP_SECONDS = 3            # signal/exit check kitli vaare (pehla 20 sec hatu = entry late)
 DASH_REFRESH = 2           # dashboard refresh seconds (live jevu). 2-3 sec Telegram mate safe
-IMG_REFRESH = 10          # image dashboard refresh seconds (Telegram photo edit slow/limited)
-IMG_CANDLES = 72          # image chart ma ketla candles
 USE_WEBSOCKET = True       # Angel One live feed (tick-by-tick). False = REST polling
 PNL_UPDATE_SECONDS = 30   # live PnL message kitli vaare update thay
 
@@ -142,10 +140,6 @@ log = logging.getLogger("bot")
 state = {
     "day": None,
     "blocked_dir": None,
-    "img_msg_id": None,
-    "img_chat": None,
-    "img_t": 0.0,
-    "img_busy": False,
     "strategy": DEFAULT_STRATEGY,
     "last_event": "—",
     "pnl_cache": None,
@@ -153,6 +147,8 @@ state = {
     "dash_msg_id": None,
     "dash_chat": None,
     "dash_t": 0.0,
+    "dash_compact": False,   # True = Compact Dashboard
+    "dash_last": "",         # last sent text (same hoy to edit na karvu)
     "mode": "paper",       # paper | live
     "running": False,
     "day_halt": None,      # divas limit hit thayu to reason (aaj nu trading band)
@@ -580,7 +576,8 @@ HISTORY_COLS = ["date", "entry_time", "exit_time", "duration_min", "mode", "stra
                 "expiry", "lots", "qty", "entry_spot", "exit_spot",
                 "sell_symbol", "sell_entry", "sell_exit", "sell_pnl",
                 "hedge_symbol", "hedge_entry", "hedge_exit", "hedge_pnl",
-                "net_credit_pts", "net_exit_pts", "net_points", "pnl", "sl_rule", "tp_rule", "reason"]
+                "net_credit_pts", "net_exit_pts", "net_points", "pnl", "sl_rule", "tp_rule", "reason",
+                "price_src", "sell_entry_oid", "hedge_entry_oid", "sell_exit_oid", "hedge_exit_oid"]
 _last_save = [0.0]
 restore_notes = []
 
@@ -591,6 +588,8 @@ def save_state():
             "day": str(state["day"]) if state["day"] else str(datetime.now().date()),
             "mode": state["mode"],
             "running": state["running"],
+            "dash_msg_id": state["dash_msg_id"], "dash_chat": state["dash_chat"],
+            "dash_compact": state["dash_compact"],
             "strategy": state["strategy"],
             "blocked_dir": state["blocked_dir"],
             "day_halt": state["day_halt"],
@@ -694,6 +693,9 @@ def load_state():
     if tfm in TIMEFRAMES:
         set_timeframe(tfm)
     state["mode"] = d.get("mode", "paper")
+    state["dash_msg_id"] = d.get("dash_msg_id")
+    state["dash_chat"] = d.get("dash_chat")
+    state["dash_compact"] = bool(d.get("dash_compact", False))
     if d.get("running"):
         state["running"] = True
         restore_notes.append(f"▶️ Bot pachho RUNNING ({state['mode'].upper()} mode) - /stop thi band karo.")
@@ -1171,6 +1173,7 @@ async def _close_position(app: Application, reason: str):
     pnl, s, h = await position_pnl()
     mode = p.get("mode", state["mode"])
     live_txt = ""
+    exit_orders, est = None, False
     if mode == "live":
         if time.time() < state.get("exit_block_t", 0):
             return                                   # pehla exit fail thayo, thodi vaar ruko
@@ -1180,6 +1183,7 @@ async def _close_position(app: Application, reason: str):
             return await notify(app, r["msg"])
         # Angel One na sacha fill price thi PnL
         s, h = r["s"], r["h"]
+        exit_orders, est = r["orders"], bool(r["warn"])
         pnl = ((p["sell_entry"] - s) + (h - p["hedge_entry"])) * p["qty"]
         live_txt = "\n" + fills_text(r["orders"], exit_=True) + (("\n" + r["warn"]) if r["warn"] else "")
     state["realized_pnl"] += pnl
@@ -1187,7 +1191,7 @@ async def _close_position(app: Application, reason: str):
         exit_spot = await spot_cached(5)
     except Exception:
         exit_spot = None
-    trade = build_trade_record(p, s, h, pnl, reason, mode, exit_spot)
+    trade = build_trade_record(p, s, h, pnl, reason, mode, exit_spot, exit_orders, est)
     state["trades"].append(trade)
     append_history(trade)
     state["last_event"] = f"{datetime.now():%H:%M} {reason} (₹{pnl:,.0f})"
@@ -1471,7 +1475,7 @@ HELP_TEXT = (
     "BEARISH/RED → SELL ATM CE + BUY hedge CE\n"
     "SL / Target = net credit na %.\n"
     "Settings navi trade thi lagu thase.\n"
-    "Commands: /menu /dashboard /image /signal /summary /status /pnl /live /run /stop /exit /mode")
+    "Commands: /menu /dashboard /signal /summary /status /pnl /live /run /stop /exit /mode")
 
 
 def main_menu_text() -> str:
@@ -1490,7 +1494,7 @@ def main_menu_text() -> str:
 
 def main_menu_kb() -> Markup:
     return Markup([
-        [Btn("📺 Text Dashboard", callback_data="dashboard"), Btn("🖼 Image Dashboard", callback_data="image")],
+        [Btn("📺 Dashboard", callback_data="dashboard")],
         [Btn("🟢 Run Bot", callback_data="run"), Btn("🔴 Stop Bot", callback_data="stop")],
         [Btn("📡 Signal", callback_data="signal"), Btn("🧠 Strategy", callback_data="strategy")],
         [Btn("📅 Today's Summary", callback_data="summary"), Btn("💹 Live PnL", callback_data="live")],
@@ -1756,28 +1760,23 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             state["running"] = False
             await q.answer("Bot band ⏸")
             return await show(main_menu_text(), main_menu_kb())
-        if d == "image":
-            await q.answer("Image dashboard banavi rahyo chhu...")
-            return await start_image(app, q.message.chat_id)
-        if d == "img_refresh":
-            await q.answer("Refreshing...")
-            state["img_msg_id"], state["img_chat"] = q.message.message_id, q.message.chat_id
-            return await update_image(app, force=True)
-        if d == "img_stop":
-            state["img_msg_id"] = None
-            await q.answer("Auto-update band")
-            return await q.edit_message_caption(
-                caption="⏹ Image dashboard auto-update band. /image thi pharithi chalu karo.",
-                reply_markup=Markup([[Btn("🖼 Image", callback_data="image"), Btn("🏠 Menu", callback_data="menu_new")]]))
         if d == "dashboard":
             await q.answer("Dashboard khuli rahyu chhe...")
             return await start_dashboard(app, q.message.chat_id)
+        if d == "dash_mode":
+            state["dash_compact"] = not state["dash_compact"]
+            state["dash_msg_id"], state["dash_chat"] = q.message.message_id, q.message.chat_id
+            save_state()
+            await q.answer("Compact view" if state["dash_compact"] else "Full view")
+            return await update_dashboard(app, force=True)
         if d == "dash_refresh":
             await q.answer("Refreshed")
             state["dash_msg_id"], state["dash_chat"] = q.message.message_id, q.message.chat_id
+            save_state()
             return await update_dashboard(app, force=True)
         if d == "dash_stop":
             state["dash_msg_id"] = None
+            save_state()
             await q.answer("Auto-update band")
             return await show("⏹ Dashboard auto-update band.\n/dashboard thi pharithi chalu karo.",
                               Markup([[Btn("📺 Dashboard", callback_data="dashboard"),
@@ -2196,8 +2195,7 @@ async def post_init(app: Application):
     """Bot ni default Menu button (message box ni baju ma) ma commands batave."""
     await app.bot.set_my_commands([
         BotCommand("menu", "🏠 Main menu (buttons)"),
-        BotCommand("dashboard", "📺 Text dashboard (live, 2 sec)"),
-        BotCommand("image", "🖼 Image dashboard (chart + gauge)"),
+        BotCommand("dashboard", "📺 Dashboard (live auto refresh)"),
         BotCommand("signal", "📡 Strategy signal"),
         BotCommand("summary", "📅 Today summary (full detail)"),
         BotCommand("trades", "🧾 Today trades (lot, rate, PnL)"),
@@ -2259,7 +2257,8 @@ async def pnl_cached(max_age=3):
 def dashboard_kb() -> Markup:
     return Markup([
         [Btn("🔄 Refresh", callback_data="dash_refresh"), Btn("⏹ Stop Auto", callback_data="dash_stop")],
-        [Btn("🏠 Menu", callback_data="menu_new")],
+        [Btn("📋 Full view" if state["dash_compact"] else "📏 Compact view", callback_data="dash_mode"),
+         Btn("🏠 Menu", callback_data="menu_new")],
     ])
 
 
@@ -2474,38 +2473,138 @@ async def dashboard_text() -> str:
     return "\n".join(L)
 
 
+async def dashboard_compact_text() -> str:
+    """Nano dashboard: 6-7 lines, mobile ma ek screen ma."""
+    esc = html.escape
+    now = datetime.now()
+    mkt_open = now.weekday() < 5 and dtime(9, 15) <= now.time() <= dtime(15, 30)
+    feed_ok = ws_ltp(NIFTY_TOKEN) is not None
+    live = state["mode"] == "live"
+    L = [f"<b>📺 Dashboard</b> {'🟢' if mkt_open else '🔴'}{'⚡' if feed_ok else '🌐'} {now:%H:%M:%S} • "
+         f"{'⚡LIVE' if live else '📝PAPER'} • {'▶️Run' if state['running'] else '⏸Stop'}"]
+    if live:
+        kick_acct()
+        f = acct["funds"] or {}
+        bal = f"₹{_fnum(f, 'availablecash', 'net'):,.0f}" if f else "..."
+        L.append(f"🏦 {esc(ANGEL_CLIENT_ID or '-')} • {bal} • {angel_conn_status(feed_ok, mkt_open)}")
+    try:
+        d, ct, st = await asyncio.to_thread(current_signal)
+        spot = await spot_cached()
+        L.append(f"📡 {esc(strategy_label())} {CANDLE_MINUTES}m {trend_name(d)} • Nifty {spot:,.0f} "
+                 f"({'▲' if spot - st >= 0 else '▼'}{abs(spot - st):,.0f})")
+    except Exception as e:
+        L.append(f"📡 n/a ({esc(str(e)[:40])})")
+    open_pnl = 0.0
+    p = state["position"]
+    if p:
+        try:
+            pnl, s_, h_ = await pnl_cached()
+            open_pnl = pnl
+            L.append(f"📌 {p['type']} • S {p['sell_entry']:.1f}→{s_:.1f} • B {p['hedge_entry']:.1f}→{h_:.1f}")
+            L.append(f"{'🟢' if pnl >= 0 else '🔴'} <b>Open {money(pnl)}</b> • SL {p['sl']:+,.0f} / TP {p['tp']:+,.0f}")
+        except Exception as e:
+            L.append(f"📌 open (PnL n/a: {esc(str(e)[:30])})")
+    else:
+        L.append("📌 No position")
+    tr = state["trades"]
+    wins = sum(1 for t in tr if t["pnl"] > 0)
+    total = state["realized_pnl"] + open_pnl
+    L.append(f"📅 {'🟢' if total >= 0 else '🔴'} <b>{money(total)}</b> • {len(tr)} trades ✅{wins} ❌{len(tr) - wins}")
+    if state["day_halt"]:
+        L.append("🛑 Daily limit hit: aaj trading band")
+    elif DAY_LIMIT_ON:
+        L.append(f"🛑 Limit -₹{DAY_LOSS_LIMIT:,.0f} / +₹{DAY_PROFIT_LIMIT:,.0f}")
+    return "\n".join(L)
+
+
+async def dashboard_any() -> str:
+    return await (dashboard_compact_text() if state["dash_compact"] else dashboard_text())
+
+
 async def start_dashboard(app: Application, chat_id: int):
     try:
-        text = await dashboard_text()
+        text = await asyncio.wait_for(dashboard_any(), timeout=15)
     except Exception as e:
         text = f"📺 Dashboard error: {html.escape(str(e))}"
     m = await app.bot.send_message(chat_id, text, reply_markup=dashboard_kb(), parse_mode="HTML")
     state["dash_msg_id"], state["dash_chat"], state["dash_t"] = m.message_id, chat_id, time.time()
+    state["dash_last"] = text
+    _dash["fails"] = 0
+    save_state()
+
+
+_dash = {"iv": float(DASH_REFRESH), "ok": 0, "fails": 0, "warn_t": 0.0}
+
+
+def _retry_after_secs(e) -> float:
+    ra = getattr(e, "retry_after", None)
+    if ra is None:
+        return 0.0
+    return ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
 
 
 async def update_dashboard(app: Application, force=False):
-    if not state["dash_msg_id"]:
+    """Auto refresh. Kyarey band nathi thatu: flood control ma slow thay, message jatu rahe to navo moklay."""
+    if not state["dash_msg_id"] or not state["dash_chat"]:
         return
-    if not force and time.time() - state["dash_t"] < DASH_REFRESH:
+    if not force and time.time() - state["dash_t"] < _dash["iv"]:
         return
     state["dash_t"] = time.time()
     try:
-        text = await dashboard_text()
-        await app.bot.edit_message_text(text, chat_id=state["dash_chat"],
-                                        message_id=state["dash_msg_id"], reply_markup=dashboard_kb(),
-                                        parse_mode="HTML")
+        text = await asyncio.wait_for(dashboard_any(), timeout=12)
+    except asyncio.TimeoutError:
+        _dash["fails"] += 1
+        if time.time() - _dash["warn_t"] > 60:
+            _dash["warn_t"] = time.time()
+            log.warning("dashboard data 12s ma nathi aavyo (API atki?) - fari try karish")
+        return
     except Exception as e:
-        if hasattr(e, "retry_after"):                       # Telegram flood control
-            state["dash_t"] = time.time() + float(e.retry_after)
-        elif "not modified" not in str(e).lower():
-            log.warning("dashboard update failed: %s", e)
-            if "not found" in str(e).lower() or "can't be edited" in str(e).lower():
-                state["dash_msg_id"] = None
+        text = f"📺 Dashboard error: {html.escape(str(e)[:80])}\n(auto fari try karse)"
+    if text == state["dash_last"] and not force:
+        return                                       # kai badlyu nathi -> Telegram call nathi
+    try:
+        await app.bot.edit_message_text(text, chat_id=state["dash_chat"], message_id=state["dash_msg_id"],
+                                        reply_markup=dashboard_kb(), parse_mode="HTML")
+        state["dash_last"] = text
+        _dash["fails"] = 0
+        _dash["ok"] += 1
+        if _dash["ok"] >= 60 and _dash["iv"] > DASH_REFRESH:      # flood pachhi dhire dhire pacho fast
+            _dash["iv"] = max(float(DASH_REFRESH), _dash["iv"] - 1)
+            _dash["ok"] = 0
+    except Exception as e:
+        msg = str(e).lower()
+        if hasattr(e, "retry_after"):                              # Telegram flood control
+            wait = _retry_after_secs(e)
+            state["dash_t"] = time.time() + wait
+            _dash["iv"] = min(8.0, _dash["iv"] + 1)                # thodu dhimu karo, pan band nahi
+            _dash["ok"] = 0
+        elif "not modified" in msg:
+            state["dash_last"] = text
+        elif "not found" in msg or "can't be edited" in msg or "message to edit" in msg:
+            log.warning("dashboard message gayo (%s) -> navo moklu chhu", e)
+            try:
+                await start_dashboard(app, state["dash_chat"])
+            except Exception as e2:
+                log.warning("navo dashboard na moklayo: %s", e2)
+        else:                                                      # timeout/network: chalu j rakho
+            _dash["fails"] += 1
+            if _dash["fails"] in (1, 10) or _dash["fails"] % 60 == 0:
+                log.warning("dashboard update failed (%d): %s", _dash["fails"], e)
+
+
+async def dash_loop(context: ContextTypes.DEFAULT_TYPE):
+    """Alag job: exit/orders slow hoy to pan dashboard refresh na atke."""
+    try:
+        await asyncio.wait_for(update_dashboard(context.application), timeout=30)
+    except Exception as e:
+        log.warning("dash_loop error: %s", e)
 
 
 async def cmd_dashboard(update: Update, ctx):
     if not authorized(update):
         return
+    if ctx.args and ctx.args[0].lower() in ("compact", "full"):
+        state["dash_compact"] = ctx.args[0].lower() == "compact"
     await start_dashboard(ctx.application, update.effective_chat.id)
 
 
@@ -2544,363 +2643,8 @@ async def fast_loop(context: ContextTypes.DEFAULT_TYPE):
         await fast_exit_check(app)
     except Exception:
         log.exception("fast exit check error")
-    await update_dashboard(app)
     if time.time() - _last_save[0] > 10:
         save_state()
-
-
-# ----------------------------- IMAGE DASHBOARD ------------------------
-def _clean(s) -> str:
-    """Image ma emoji glyph nathi, etle badha non-BMP/emoji char kadhi nakho."""
-    return re.sub(r"[^\x20-\u2fff\n]", "", str(s)).strip()
-
-
-def plot_series(strategy: str, df: pd.DataFrame):
-    """Chart mate (direction array, reference-line array) - puri df par."""
-    if strategy == "ema":
-        fast = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-        slow = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-        return np.where(fast > slow, 1, -1), slow.values
-    if strategy == "rsi_wma":
-        _, _, sma, dirs = rsi_wma_calc(df)
-        return np.asarray(dirs), sma.values
-    d2 = supertrend(df)
-    return d2["dir"].values, d2["st"].values
-
-
-async def build_snapshot() -> dict:
-    now = datetime.now()
-    d, ct, line_now = await asyncio.to_thread(current_signal)      # candle cache bharay
-    df = _candle_cache["df"]
-    spot = await spot_cached()
-    dirs, line = plot_series(state["strategy"], df)
-    N = IMG_CANDLES
-    sub = df.iloc[-N:].reset_index(drop=True)
-    o, h, l, c = (sub[k].values.astype(float) for k in ("open", "high", "low", "close"))
-    c[-1] = spot                         # chalu candle live dekhay
-    h[-1], l[-1] = max(h[-1], spot), min(l[-1], spot)
-    times = [t.to_pydatetime() if hasattr(t, "to_pydatetime") else t for t in sub["time"]]
-    mkt_open = now.weekday() < 5 and dtime(9, 15) <= now.time() <= dtime(15, 30)
-    if mkt_open:
-        open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        bk = int((now - open_t).total_seconds() // (60 * CANDLE_MINUTES))
-        nxt = (open_t + timedelta(minutes=CANDLE_MINUTES * (bk + 1))).strftime("%H:%M")
-    else:
-        nxt = "-"
-    atm = round(spot / STRIKE_STEP) * STRIKE_STEP
-
-    pos = None
-    p = state["position"]
-    if p:
-        try:
-            pnl, s_, h_ = await pnl_cached()
-            qty = p["qty"]
-            t_entry = datetime.combine(now.date(), datetime.strptime(p["time"], "%H:%M:%S").time())
-            idx = None
-            for i, t in enumerate(times):
-                if t <= t_entry < t + timedelta(minutes=CANDLE_MINUTES):
-                    idx = i
-            e_price = p.get("spot") or (float(c[idx]) if idx is not None else None)
-            try:
-                exp = f"{datetime.strptime(p['expiry'], '%Y-%m-%d'):%d %b}"
-            except Exception:
-                exp = p["expiry"]
-            pos = {"type": p["type"], "exp": exp, "since": p["time"], "pnl": pnl, "sl": p["sl"], "tp": p["tp"],
-                   "credit": p["credit"] * qty, "idx": idx, "e_price": e_price,
-                   "legs": [("SELL", p["sell"]["symbol"], p["sell_entry"], s_, (p["sell_entry"] - s_) * qty),
-                            ("BUY", p["hedge"]["symbol"], p["hedge_entry"], h_, (h_ - p["hedge_entry"]) * qty)]}
-        except Exception as e:
-            log.warning("snapshot position error: %s", e)
-
-    tr = state["trades"]
-    wins = sum(1 for t in tr if t["pnl"] > 0)
-    open_pnl = pos["pnl"] if pos else 0.0
-    return {
-        "label": strategy_label(), "tf": CANDLE_MINUTES, "line_name": strategy_line(),
-        "now": now, "mode": state["mode"], "running": state["running"],
-        "feed_ok": ws_ltp(NIFTY_TOKEN) is not None, "mkt_open": mkt_open,
-        "o": o, "h": h, "l": l, "c": c, "times": times,
-        "dirs": np.asarray(dirs)[-N:], "line": np.asarray(line, dtype=float)[-N:],
-        "spot": spot, "line_now": line_now, "trend": d, "plan": plan_text(d, atm),
-        "candle": f"{ct:%H:%M}", "next": nxt, "pos": pos,
-        "today": {"n": len(tr), "wins": wins, "losses": len(tr) - wins, "realized": state["realized_pnl"],
-                  "open": open_pnl, "total": state["realized_pnl"] + open_pnl, "last": state["last_event"]},
-        "footer": f"SL {limit_short(SL_MODE, SL_VALUE)}   •   TP {limit_short(TP_MODE, TP_VALUE)}   •   "
-                  f"Hedge {HEDGE_PCT * 100:.0f}%   •   Lots {LOTS}   •   {ENTRY_START:%H:%M}-{LAST_ENTRY:%H:%M} / exit {FORCE_EXIT:%H:%M}",
-    }
-
-
-def render_png(sn: dict) -> bytes:
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.patches import FancyBboxPatch, Rectangle, Wedge, Circle
-
-    BG, CARD, CARD2 = "#0b1020", "#131a2e", "#18213a"
-    TXT, MUTED = "#e8ecf8", "#7d8aa8"
-    GREEN, RED, AMBER, BLUE = "#22d39a", "#ff5a6e", "#ffb547", "#5b8cff"
-    W, H = 10.8, 16.9
-    fig = Figure(figsize=(W, H), dpi=100, facecolor=BG)
-    FigureCanvasAgg(fig)
-    root = fig.add_axes([0, 0, 1, 1])
-    root.set_xlim(0, W)
-    root.set_ylim(0, H)
-    root.axis("off")
-
-    def card(x, y, w, h, fc=CARD):
-        root.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=0.22",
-                                      fc=fc, ec="#222c4a", lw=1.2))
-
-    def text(x, y, s, size=12, color=TXT, weight="normal", ha="left", va="center"):
-        root.text(x, y, _clean(s), fontsize=size, color=color, fontweight=weight, ha=ha, va=va)
-
-    def pill(x, y, label, color, w):
-        root.add_patch(FancyBboxPatch((x, y - 0.2), w, 0.4, boxstyle="round,pad=0,rounding_size=0.2",
-                                      fc=color + "22", ec=color, lw=1.2))
-        text(x + w / 2, y, label, 10.5, color, "bold", "center")
-
-    now, spot, d = sn["now"], sn["spot"], sn["trend"]
-    tcol = GREEN if d == 1 else (RED if d == -1 else AMBER)
-    tname = {1: "BULLISH", -1: "BEARISH"}.get(d, "NEUTRAL")
-    pos, td = sn["pos"], sn["today"]
-
-    # ---------- header ----------
-    text(0.5, H - 0.55, "NIFTY SPREAD BOT", 22, TXT, "bold")
-    text(0.5, H - 1.0, f"{sn['label']}  •  {sn['tf']}m  •  {now:%a %d %b}"
-         f"  •  Market {'OPEN' if sn['mkt_open'] else 'CLOSED'}", 11, MUTED)
-    text(W - 0.5, H - 0.55, f"{now:%H:%M:%S}", 20, TXT, "bold", "right")
-    x = W - 0.5
-    for lab, col in [("RUNNING" if sn["running"] else "STOPPED", GREEN if sn["running"] else RED),
-                     ("WS LIVE" if sn["feed_ok"] else "REST", GREEN if sn["feed_ok"] else AMBER),
-                     ("LIVE" if sn["mode"] == "live" else "PAPER", AMBER if sn["mode"] == "live" else BLUE)]:
-        w = 0.17 * len(lab) + 0.45
-        x -= w
-        pill(x, H - 1.0, lab, col, w)
-        x -= 0.15
-
-    # ---------- chart ----------
-    cy1 = H - 1.3
-    cy0 = cy1 - 4.6
-    card(0.35, cy0, W - 0.7, cy1 - cy0)
-    text(0.65, cy1 - 0.35, "NIFTY 50", 13, TXT, "bold")
-    text(1.95, cy1 - 0.35, f"{spot:,.2f}", 13, tcol, "bold")
-    root.add_patch(Circle((W - 3.2, cy1 - 0.35), 0.07, fc=GREEN))
-    text(W - 3.05, cy1 - 0.35, "up", 9.5, MUTED)
-    root.add_patch(Circle((W - 2.4, cy1 - 0.35), 0.07, fc=RED))
-    text(W - 2.25, cy1 - 0.35, "down", 9.5, MUTED)
-    n = len(sn["c"])
-    ax = fig.add_axes([0.07, (cy0 + 0.45) / H, 0.855, (cy1 - cy0 - 1.0) / H], facecolor=CARD)
-    ax.set_xlim(-1, n + 7)
-    allv = np.r_[sn["l"], sn["h"], sn["line"][np.isfinite(sn["line"])]]
-    pad = (allv.max() - allv.min()) * 0.08 or 10
-    lo, hi = allv.min() - pad, allv.max() + pad
-    ax.set_ylim(lo, hi)
-    for sp in ax.spines.values():
-        sp.set_visible(False)
-    ax.tick_params(colors=MUTED, labelsize=9, length=0)
-    ax.yaxis.tick_right()
-    step = max(1, n // 6)
-    ax.set_xticks(list(range(0, n, step)))
-    ax.set_xticklabels([sn["times"][i].strftime("%H:%M") for i in range(0, n, step)])
-    ax.grid(axis="y", color="#232c4a", lw=0.8)
-    for i in range(n):
-        col = GREEN if sn["c"][i] >= sn["o"][i] else RED
-        ax.plot([i, i], [sn["l"][i], sn["h"][i]], color=col, lw=1.1, zorder=3)
-        ax.add_patch(Rectangle((i - 0.32, min(sn["o"][i], sn["c"][i])), 0.64,
-                               max(abs(sn["c"][i] - sn["o"][i]), (hi - lo) * 0.002), fc=col, ec=col, zorder=4))
-    dirs, line = sn["dirs"], sn["line"]
-    for i in range(1, n):
-        if dirs[i] == dirs[i - 1] and np.isfinite(line[i]) and np.isfinite(line[i - 1]):
-            ax.plot([i - 1, i], [line[i - 1], line[i]], color=GREEN if dirs[i] == 1 else (RED if dirs[i] == -1 else AMBER),
-                    lw=2.4, zorder=5)
-    ok = np.isfinite(line)
-    ax.fill_between(range(n), line, sn["c"], where=(dirs == 1) & ok, color=GREEN, alpha=0.06, zorder=1)
-    ax.fill_between(range(n), line, sn["c"], where=(dirs == -1) & ok, color=RED, alpha=0.06, zorder=1)
-    if pos and pos["idx"] is not None and pos["e_price"]:
-        ex, rng = pos["idx"], hi - lo
-        if pos["type"] == "PE":      # bullish: arrow neeche thi upar
-            ax.annotate("", xy=(ex, sn["l"][ex] - rng * 0.01), xytext=(ex, sn["l"][ex] - rng * 0.09),
-                        arrowprops=dict(arrowstyle="-|>", color=AMBER, lw=2.2), zorder=7)
-            ax.text(ex, sn["l"][ex] - rng * 0.11, f"ENTRY\n{pos['type']} spread", color=AMBER, fontsize=9.5,
-                    fontweight="bold", ha="center", va="top", zorder=7)
-        else:                        # bearish: arrow upar thi neeche
-            ax.annotate("", xy=(ex, sn["h"][ex] + rng * 0.01), xytext=(ex, sn["h"][ex] + rng * 0.09),
-                        arrowprops=dict(arrowstyle="-|>", color=AMBER, lw=2.2), zorder=7)
-            ax.text(ex, sn["h"][ex] + rng * 0.11, f"ENTRY\n{pos['type']} spread", color=AMBER, fontsize=9.5,
-                    fontweight="bold", ha="center", va="bottom", zorder=7)
-        ax.axhline(pos["e_price"], color=AMBER, lw=1, ls=(0, (4, 4)), alpha=0.7, zorder=2)
-    ax.axhline(spot, color=TXT, lw=0.9, ls=(0, (2, 3)), alpha=0.6, zorder=2)
-    ax.text(n + 6.8, spot, f" {spot:,.1f} ", color=BG, fontsize=9.5, fontweight="bold", ha="right", va="center",
-            bbox=dict(boxstyle="round,pad=0.25", fc=tcol, ec="none"), zorder=8)
-    if np.isfinite(sn["line_now"]):
-        ax.text(n + 6.8, sn["line_now"], f" {sn['line_name']} {sn['line_now']:,.0f} ", color=BG, fontsize=8.5,
-                fontweight="bold", ha="right", va="center",
-                bbox=dict(boxstyle="round,pad=0.2", fc=tcol, ec="none", alpha=0.85), zorder=8)
-
-    # ---------- 3 KPI cards ----------
-    ky = cy0 - 0.2 - 1.35
-    cw = (W - 0.7 - 0.5) / 3
-    gap = spot - sn["line_now"]
-    kp = [("TREND", tname, sn["plan"], tcol),
-          ("NIFTY", f"{spot:,.1f}", f"Last candle {sn['candle']}  >  next {sn['next']}", TXT),
-          (f"GAP vs {sn['line_name']}", f"{abs(gap):,.0f} pts", "above line" if gap >= 0 else "below line", AMBER)]
-    for k, (t1, t2, t3, col) in enumerate(kp):
-        x0 = 0.35 + k * (cw + 0.25)
-        card(x0, ky, cw, 1.35, CARD2)
-        text(x0 + 0.25, ky + 1.07, t1, 10, MUTED, "bold")
-        text(x0 + 0.25, ky + 0.68, t2, 19, col, "bold")
-        text(x0 + 0.25, ky + 0.28, t3, 8.8, MUTED)
-
-    # ---------- gauge ----------
-    gy1 = ky - 0.2
-    gy0 = gy1 - 3.4
-    card(0.35, gy0, W - 0.7, gy1 - gy0)
-    text(0.65, gy1 - 0.38, "LIVE PnL", 13, TXT, "bold")
-    cx, cyg, R = W / 2, gy0 + 1.25, 1.85
-    if pos:
-        text(W - 0.65, gy1 - 0.38, f"{pos['type']} SPREAD  •  Exp {pos['exp']}  •  since {pos['since'][:5]}",
-             10, MUTED, ha="right")
-        sl, tp, pnl = pos["sl"], pos["tp"], pos["pnl"]
-        for a1, a0, col in [(180, 120, RED), (120, 60, AMBER), (60, 0, GREEN)]:
-            root.add_patch(Wedge((cx, cyg), R, a0, a1, width=0.36, fc=col, ec=BG, lw=3, alpha=0.9))
-        frac = max(0.0, min(1.0, (pnl - sl) / (tp - sl) if tp != sl else 0.5))
-        ang = np.deg2rad(180 - frac * 180)
-        root.plot([cx, cx + (R - 0.5) * np.cos(ang)], [cyg, cyg + (R - 0.5) * np.sin(ang)],
-                  color=TXT, lw=3.2, solid_capstyle="round", zorder=10)
-        root.add_patch(Circle((cx, cyg), 0.16, fc=TXT, zorder=11))
-        text(cx - R + 0.2, cyg - 0.3, f"SL\n-₹{abs(sl):,.0f}", 9.5, RED, "bold", "center")
-        text(cx + R - 0.2, cyg - 0.3, f"TP\n+₹{tp:,.0f}", 9.5, GREEN, "bold", "center")
-        pcol = GREEN if pnl >= 0 else RED
-        sign = "+" if pnl >= 0 else "-"
-        text(cx, cyg - 0.5, f"{sign}₹{abs(pnl):,.0f}", 30, pcol, "bold", "center")
-        pc = pnl / pos["credit"] * 100 if pos["credit"] else 0
-        tgt = (f"{pnl / tp * 100:.0f}% of target" if pnl >= 0 else f"{abs(pnl) / abs(sl) * 100:.0f}% of SL")
-        text(cx, cyg - 0.98, f"{pc:+.0f}% of credit  •  {tgt}", 10.5, MUTED, ha="center")
-    else:
-        text(cx, cyg + 0.2, "NO OPEN POSITION", 24, MUTED, "bold", "center")
-        text(cx, cyg - 0.45, f"Next entry: {sn['plan']}", 12, TXT, ha="center")
-        text(cx, cyg - 0.95, "signal / candle close ni rah", 10, MUTED, ha="center")
-
-    # ---------- legs table ----------
-    ty = gy0 - 0.2
-    th = 2.0
-    card(0.35, ty - th, W - 0.7, th)
-    cols = [0.65, 2.5, 5.6, 7.4, 9.1]
-    for xx, lab in zip(cols, ["LEG", "SYMBOL", "ENTRY", "LTP", "PnL"]):
-        text(xx, ty - 0.35, lab, 9.5, MUTED, "bold")
-    root.plot([0.6, W - 0.6], [ty - 0.62, ty - 0.62], color="#25304f", lw=1)
-    if pos:
-        for r, (leg, sym, e, lt, pl) in enumerate(pos["legs"]):
-            yy = ty - 0.95 - r * 0.5
-            text(cols[0], yy, leg, 11.5, RED if leg == "SELL" else GREEN, "bold")
-            text(cols[1], yy, sym, 10.5, TXT)
-            text(cols[2], yy, f"{e:.2f}", 11.5, TXT)
-            text(cols[3], yy, f"{lt:.2f}", 11.5, TXT, "bold")
-            text(cols[4], yy, f"{pl:+,.0f}", 11.5, GREEN if pl >= 0 else RED, "bold")
-    else:
-        text(W / 2, ty - 1.3, "-  koi open position nathi  -", 11, MUTED, ha="center")
-
-    # ---------- today ----------
-    ay1 = ty - th - 0.2
-    ay0 = ay1 - 2.6
-    card(0.35, ay0, W - 0.7, ay1 - ay0)
-    tot = td["total"]
-    text(0.65, ay1 - 0.38, "TODAY", 13, TXT, "bold")
-    text(W - 0.65, ay1 - 0.38, f"{'+' if tot >= 0 else '-'}₹{abs(tot):,.0f}", 20, GREEN if tot >= 0 else RED, "bold", "right")
-    money = lambda v: f"{'+' if v >= 0 else '-'}₹{abs(v):,.0f}"
-    stats = [("Trades", str(td["n"]), TXT), ("Wins", str(td["wins"]), GREEN), ("Losses", str(td["losses"]), RED),
-             ("Realized", money(td["realized"]), GREEN if td["realized"] >= 0 else RED),
-             ("Open", money(td["open"]), GREEN if td["open"] >= 0 else RED)]
-    sw = (W - 1.3) / len(stats)
-    for k, (lab, val, col) in enumerate(stats):
-        x0 = 0.65 + k * sw
-        text(x0, ay1 - 0.9, lab, 9.5, MUTED)
-        text(x0, ay1 - 1.28, val, 15, col, "bold")
-    by = ay1 - 1.8
-    wr = td["wins"] / td["n"] if td["n"] else 0
-    text(0.65, by, "Win rate", 9.5, MUTED)
-    root.add_patch(FancyBboxPatch((1.9, by - 0.1), W - 3.6, 0.2, boxstyle="round,pad=0,rounding_size=0.1", fc="#1f2947", ec="none"))
-    if wr > 0:
-        root.add_patch(FancyBboxPatch((1.9, by - 0.1), (W - 3.6) * wr, 0.2, boxstyle="round,pad=0,rounding_size=0.1", fc=GREEN, ec="none"))
-    text(W - 0.65, by, f"{wr * 100:.0f}%" if td["n"] else "-", 11, GREEN, "bold", "right")
-    text(0.65, ay0 + 0.28, f"Last: {td['last']}", 9.5, MUTED)
-
-    # ---------- footer ----------
-    text(0.5, 0.5, sn["footer"], 10, MUTED)
-    text(W - 0.5, 0.5, f"updated {now:%H:%M:%S}", 10, MUTED, ha="right")
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=BG, dpi=100)
-    return buf.getvalue()
-
-
-_render_lock = threading.Lock()
-
-
-def _render_safe(sn: dict) -> bytes:
-    with _render_lock:
-        return render_png(sn)
-
-
-async def make_image() -> bytes:
-    sn = await build_snapshot()
-    return await asyncio.to_thread(_render_safe, sn)
-
-
-def image_kb() -> Markup:
-    return Markup([
-        [Btn("🔄 Refresh", callback_data="img_refresh"), Btn("⏹ Stop Auto", callback_data="img_stop")],
-        [Btn("📺 Text Dashboard", callback_data="dashboard"), Btn("🏠 Menu", callback_data="menu_new")],
-    ])
-
-
-def image_caption() -> str:
-    return f"🖼 Image Dashboard • {datetime.now():%H:%M:%S} • auto {IMG_REFRESH}s"
-
-
-async def start_image(app: Application, chat_id: int):
-    try:
-        png = await make_image()
-    except ImportError:
-        return await app.bot.send_message(chat_id, "🖼 Image dashboard mate: pip install matplotlib karo, "
-                                                   "pachi bot restart karo. (Text dashboard chalu j che.)")
-    except Exception as e:
-        log.exception("image dashboard error")
-        return await app.bot.send_message(chat_id, f"🖼 Image error: {e}")
-    m = await app.bot.send_photo(chat_id, photo=png, caption=image_caption(), reply_markup=image_kb())
-    state["img_msg_id"], state["img_chat"], state["img_t"] = m.message_id, chat_id, time.time()
-
-
-async def update_image(app: Application, force=False):
-    if not state["img_msg_id"] or state["img_busy"]:
-        return
-    if not force and time.time() - state["img_t"] < IMG_REFRESH - 1:
-        return
-    state["img_busy"] = True
-    state["img_t"] = time.time()
-    try:
-        png = await make_image()
-        await app.bot.edit_message_media(chat_id=state["img_chat"], message_id=state["img_msg_id"],
-                                         media=InputMediaPhoto(media=png, caption=image_caption()),
-                                         reply_markup=image_kb())
-    except Exception as e:
-        if hasattr(e, "retry_after"):                       # Telegram flood control
-            state["img_t"] = time.time() + float(e.retry_after)
-        elif "not modified" not in str(e).lower():
-            log.warning("image update failed: %s", e)
-            if "not found" in str(e).lower() or "can't be edited" in str(e).lower():
-                state["img_msg_id"] = None
-    finally:
-        state["img_busy"] = False
-
-
-async def img_loop(context: ContextTypes.DEFAULT_TYPE):
-    await update_image(context.application)
-
-
-async def cmd_image(update: Update, ctx):
-    if not authorized(update):
-        return
-    await start_image(ctx.application, update.effective_chat.id)
 
 
 # ----------------------------- TRADE DETAIL / HISTORY / SUMMARY --------
@@ -2949,7 +2693,8 @@ def _exp_txt(e) -> str:
         return str(e or "-")
 
 
-def build_trade_record(p: dict, s: float, h: float, pnl: float, reason: str, mode: str, exit_spot) -> dict:
+def build_trade_record(p: dict, s: float, h: float, pnl: float, reason: str, mode: str, exit_spot,
+                       exit_orders=None, est=False) -> dict:
     now = datetime.now()
     qty = p["qty"]
     lots = p.get("lots") or max(1, round(qty / LOT_SIZE))
@@ -2963,7 +2708,13 @@ def build_trade_record(p: dict, s: float, h: float, pnl: float, reason: str, mod
     dur = round((now - edt).total_seconds() / 60, 1) if edt and now >= edt else ""
     sell_pts = p["sell_entry"] - s
     hedge_pts = h - p["hedge_entry"]
+    eo, xo = (p.get("orders") or {}), (exit_orders or {})
+    oid = lambda d_, k: (d_.get(k) or {}).get("oid") or ""
+    angel = mode == "live" and bool(eo)
     return {
+        "price_src": ("angel+est" if est else "angel") if angel else "ltp",
+        "sell_entry_oid": oid(eo, "sell"), "hedge_entry_oid": oid(eo, "hedge"),
+        "sell_exit_oid": oid(xo, "sell_exit"), "hedge_exit_oid": oid(xo, "hedge_exit"),
         "date": str(now.date()), "entry_time": edt.strftime("%H:%M:%S") if edt else p.get("time", ""),
         "exit_time": now.strftime("%H:%M:%S"), "time": now.strftime("%H:%M:%S"), "duration_min": dur,
         "mode": mode, "strategy": p.get("strategy", ""), "timeframe": p.get("tf", ""),
@@ -3009,6 +2760,11 @@ def trade_block(r: dict, num=None) -> str:
     cr, ex = fnum(r, "net_credit_pts"), fnum(r, "net_exit_pts")
     if cr is not None and ex is not None:
         L.append(f"Credit {cr:.2f} → Exit {ex:.2f} = {cr - ex:+.2f} pts")
+    src = str(r.get("price_src") or "")
+    if src.startswith("angel"):
+        ids = " ".join(f"{lab}#{r[k]}" for k, lab in (("hedge_entry_oid", "B"), ("sell_entry_oid", "S"),
+                                                        ("sell_exit_oid", "S-exit"), ("hedge_exit_oid", "B-exit")) if r.get(k))
+        L.append("📒 Angel fill prices" + (" (hedge exit andaje)" if src == "angel+est" else "") + (f" | {ids}" if ids else ""))
     L.append(f"💰 Net PnL: {money(pnl)}  [{r.get('reason', '')}]")
     if r.get("sl_rule"):
         L.append(f"SL: {r['sl_rule']} | TP: {r.get('tp_rule', '')}")
@@ -3191,13 +2947,13 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("image", cmd_image), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_button))
     app.job_queue.run_repeating(tick, interval=LOOP_SECONDS, first=5)
     app.job_queue.run_repeating(fast_loop, interval=DASH_REFRESH, first=3)
-    app.job_queue.run_repeating(img_loop, interval=IMG_REFRESH, first=8)
+    app.job_queue.run_repeating(dash_loop, interval=1, first=4)      # dashboard auto refresh (alag job)
     app.run_polling()
 
 
