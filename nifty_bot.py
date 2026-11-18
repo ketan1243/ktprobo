@@ -82,7 +82,8 @@ TIMEFRAMES = {
 LOT_SIZE = 65          # <-- Nifty current lot size verify karo
 LOTS = 1
 STRIKE_STEP = 50
-HEDGE_PCT = 0.30       # hedge premium = 30% of ATM premium
+HEDGE_PCT = 0.30       # hedge premium = 30% of SOLD option premium (hedge, sell strike thi bahar)
+SELL_OFFSET = 0        # sell strike: 0=ATM, +1..+5 = OTM-1..5, -1..-5 = ITM-1..5 (Telegram Settings / /strike)
 # SL / Target: mode = "pct" (% of net credit) | "amount" (₹ total) | "points" (premium points per unit)
 SL_MODE, SL_VALUE = "pct", 50.0
 TP_MODE, TP_VALUE = "pct", 50.0
@@ -727,7 +728,7 @@ def save_state():
             "trades": state["trades"],
             "position": state["position"],
             "last_event": state["last_event"],
-            "settings": {"LOTS": LOTS, "HEDGE_PCT": HEDGE_PCT, "SL_MODE": SL_MODE, "SL_VALUE": SL_VALUE,
+            "settings": {"LOTS": LOTS, "HEDGE_PCT": HEDGE_PCT, "SELL_OFFSET": SELL_OFFSET, "SL_MODE": SL_MODE, "SL_VALUE": SL_VALUE,
                          "TP_MODE": TP_MODE, "TP_VALUE": TP_VALUE, "EXIT_ON_FLIP": EXIT_ON_FLIP,
                          "ENTRY_START": ENTRY_START.strftime("%H:%M"), "LAST_ENTRY": LAST_ENTRY.strftime("%H:%M"),
                          "FORCE_EXIT": FORCE_EXIT.strftime("%H:%M"),
@@ -783,7 +784,7 @@ def read_history():
 def load_state():
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
     global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
-    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -796,6 +797,7 @@ def load_state():
     st = d.get("settings", {})
     LOTS = int(st.get("LOTS", LOTS))
     HEDGE_PCT = float(st.get("HEDGE_PCT", HEDGE_PCT))
+    SELL_OFFSET = max(-5, min(5, int(st.get("SELL_OFFSET", SELL_OFFSET))))
     if st.get("SL_MODE") in MODE_INFO and st.get("TP_MODE") in MODE_INFO:
         SL_MODE, SL_VALUE = st["SL_MODE"], float(st.get("SL_VALUE", SL_VALUE))
         TP_MODE, TP_VALUE = st["TP_MODE"], float(st.get("TP_VALUE", TP_VALUE))
@@ -1041,12 +1043,23 @@ def trend_name(d: int) -> str:
     return {1: "🟢 BULLISH (UP)", -1: "🔴 BEARISH (DOWN)"}.get(d, "⚪ NEUTRAL")
 
 
+def sell_label(off: int) -> str:
+    return "ATM" if off == 0 else (f"OTM-{off}" if off > 0 else f"ITM-{-off}")
+
+
+def sell_strike_for(opt_type: str, atm: float) -> float:
+    """OTM: PE ma niche, CE ma upar. ITM: ulatu."""
+    sign = -1 if opt_type == "PE" else 1
+    return atm + sign * SELL_OFFSET * STRIKE_STEP
+
+
 def plan_text(d: int, atm: float) -> str:
     if d == 0:
         return "Wait (no trade)"
     if ONE_TRADE_PER_TREND and state["blocked_dir"] == d and not state["position"]:
         return "Wait for trend flip"
-    return f"SELL {atm:.0f} {'PE' if d == 1 else 'CE'} + hedge"
+    ot = "PE" if d == 1 else "CE"
+    return f"SELL {sell_strike_for(ot, atm):.0f} {ot} ({sell_label(SELL_OFFSET)}) + hedge"
 
 
 def strategy_line() -> str:
@@ -1213,17 +1226,19 @@ async def open_position(direction: int, app: Application):
     t0 = time.time()
     spot = await spot_cached()                       # WS / poller thi fast price
     atm = round(spot / STRIKE_STEP) * STRIKE_STEP
+    sell_strike = sell_strike_for(opt_type, atm)      # ATM / OTM-n / ITM-n (setting mujab)
+    sel_lbl = sell_label(SELL_OFFSET)
     expiry = nearest_expiry()
     qty = LOT_SIZE * LOTS
 
     try:
         # ek j API call ma ATM + hedge candidates (junu 6-8 calls no rasto hatu)
-        sell_opt, sell_px, hedge_opt, hedge_px = await asyncio.to_thread(pick_legs_batch, opt_type, atm, expiry)
+        sell_opt, sell_px, hedge_opt, hedge_px = await asyncio.to_thread(pick_legs_batch, opt_type, sell_strike, expiry)
     except Exception as e:
         log.warning("batch leg pick fail (%s) -> junu dhimu rasto", e)
-        sell_opt = find_option(atm, opt_type, expiry)
+        sell_opt = find_option(sell_strike, opt_type, expiry)
         sell_px = await asyncio.to_thread(ltp, "NFO", sell_opt["symbol"], sell_opt["token"])
-        hedge_opt, hedge_px = await asyncio.to_thread(pick_hedge, opt_type, atm, sell_px, expiry)
+        hedge_opt, hedge_px = await asyncio.to_thread(pick_hedge, opt_type, sell_strike, sell_px, expiry)
 
     credit = sell_px - hedge_px  # per unit
     if credit <= 0:
@@ -1251,7 +1266,7 @@ async def open_position(direction: int, app: Application):
         "sell": sell_opt, "sell_entry": sell_px,
         "hedge": hedge_opt, "hedge_entry": hedge_px,
         "credit": credit,
-        "orders": orders_info, "ltp_ref": list(ltp_ref),
+        "orders": orders_info, "ltp_ref": list(ltp_ref), "sell_sel": sel_lbl,
         "sl": -calc_limit(SL_MODE, SL_VALUE, credit, qty),
         "tp": calc_limit(TP_MODE, TP_VALUE, credit, qty),
         "sl_txt": limit_text(SL_MODE, SL_VALUE), "tp_txt": limit_text(TP_MODE, TP_VALUE),
@@ -1265,8 +1280,8 @@ async def open_position(direction: int, app: Application):
     save_state()
     await notify(app,
         f"✅ ENTRY [{state['mode'].upper()}] {strategy_label()} {'UP 🟢' if direction == 1 else 'DOWN 🔴'}\n"
-        f"SELL {sell_opt['symbol']} @ {sell_px:.2f}\n"
-        f"BUY  {hedge_opt['symbol']} @ {hedge_px:.2f}\n"
+        f"SELL {sell_opt['symbol']} @ {sell_px:.2f}  ({sel_lbl}, Nifty {spot:,.0f})\n"
+        f"BUY  {hedge_opt['symbol']} @ {hedge_px:.2f}  (hedge, sell strike thi bahar)\n"
         f"Expiry: {expiry:%d %b %Y} ({EXPIRY_MODES[EXPIRY_MODE].split(' (')[0]})\n"
         f"Lots: {LOTS} | Qty: {qty} | Net credit/unit: {credit:.2f}\n"
         f"🛡 SL: -₹{abs(state['position']['sl']):,.0f} ({state['position']['sl_txt']})\n"
@@ -1795,7 +1810,8 @@ def day_limit_text() -> str:
 def settings_text() -> str:
     return (f"⚙️ Settings (navi trade thi lagu)\n"
             f"Lots: {LOTS} (qty {LOT_SIZE * LOTS})\n"
-            f"Hedge premium: {HEDGE_PCT * 100:.0f}% of ATM\n"
+            f"Sell strike: {sell_label(SELL_OFFSET)}\n"
+            f"Hedge premium: {HEDGE_PCT * 100:.0f}% of sold option\n"
             f"🛡 Stop loss: {limit_text(SL_MODE, SL_VALUE)}\n"
             f"🎯 Target: {limit_text(TP_MODE, TP_VALUE)}\n"
             f"📅 Expiry: {expiry_label()}\n"
@@ -1819,6 +1835,8 @@ def settings_kb() -> Markup:
     return Markup([
         [Btn("➖ Lots", callback_data="set_lots_-1"), Btn(f"{LOTS}", callback_data="noop"),
          Btn("➕ Lots", callback_data="set_lots_1")],
+        [Btn("◀ ITM", callback_data="set_soff_-1"), Btn(f"Sell: {sell_label(SELL_OFFSET)}", callback_data="noop"),
+         Btn("OTM ▶", callback_data="set_soff_1")],
         [Btn("➖ Hedge%", callback_data="set_hedge_-5"), Btn(f"{HEDGE_PCT * 100:.0f}%", callback_data="noop"),
          Btn("➕ Hedge%", callback_data="set_hedge_5")],
         [Btn(f"🛡 SL type: {MODE_INFO[SL_MODE]['name']} 🔄", callback_data="set_slm_0")],
@@ -1835,7 +1853,7 @@ def settings_kb() -> Markup:
 
 
 async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
     q = update.callback_query
     if ALLOWED_CHAT_ID and q.message.chat_id != ALLOWED_CHAT_ID:
@@ -2088,6 +2106,8 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             v = int(val)
             if key == "lots":
                 LOTS = max(1, min(50, LOTS + v))
+            elif key == "soff":
+                SELL_OFFSET = max(-5, min(5, SELL_OFFSET + v))
             elif key == "hedge":
                 HEDGE_PCT = max(0.10, min(0.60, round(HEDGE_PCT + v / 100, 2)))
             elif key == "slm":
@@ -2193,6 +2213,24 @@ async def _cmd_limit(update: Update, ctx, which: str):
         TP_MODE, TP_VALUE = mode, value
     save_state()
     await update.message.reply_text(f"✅ {name} set: {limit_text(mode, value)}\nNavi trade thi lagu thase.")
+
+
+async def cmd_strike(update: Update, ctx):
+    global SELL_OFFSET
+    if not authorized(update):
+        return
+    usage = (f"🎯 Sell strike: {sell_label(SELL_OFFSET)}\n\n/strike atm\n/strike otm1 ... otm5\n/strike itm1 ... itm5\n"
+             f"Hedge sold option na premium na {HEDGE_PCT * 100:.0f}% mujab, sell strike thi bahar select thase.\n"
+             f"(Navi trade thi lagu)")
+    if not ctx.args:
+        return await update.message.reply_text(usage)
+    a = ctx.args[0].lower().replace("-", "").replace("_", "")
+    m = re.fullmatch(r"(atm|otm([1-5])|itm([1-5]))", a)
+    if not m:
+        return await update.message.reply_text("❌ Samajyu nahi.\n\n" + usage)
+    SELL_OFFSET = 0 if a == "atm" else (int(m.group(2)) if m.group(2) else -int(m.group(3)))
+    save_state()
+    await update.message.reply_text(f"✅ Sell strike: {sell_label(SELL_OFFSET)} (navi trade thi lagu)")
 
 
 async def cmd_daylimit(update: Update, ctx):
@@ -2361,6 +2399,7 @@ async def post_init(app: Application):
         BotCommand("daylimit", "🛑 Daily profit/loss limit"),
         BotCommand("testorder", "🧪 Angel One connection / order test"),
         BotCommand("orders", "📒 Angel One aaj na orders"),
+        BotCommand("strike", "🎯 Sell strike (ATM / OTM / ITM)"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -3121,7 +3160,7 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_button))
