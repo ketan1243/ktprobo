@@ -1220,8 +1220,9 @@ def main_menu_kb() -> Markup:
         [Btn("📜 Today Trades", callback_data="trades"), Btn("🗂 History", callback_data="history")],
         [Btn("🚪 Exit Position", callback_data="exit")],
         [Btn("📝 Paper Mode", callback_data="mode_paper"), Btn("⚡ Live Mode", callback_data="mode_live")],
-        [Btn("⚙️ Settings", callback_data="settings"), Btn("🔄 Refresh", callback_data="menu")],
-        [Btn("❓ Help", callback_data="help"), Btn("❌ Close", callback_data="close")],
+        [Btn("⚙️ Settings", callback_data="settings"), Btn("🧪 Angel Test", callback_data="angeltest")],
+        [Btn("🔄 Refresh", callback_data="menu"), Btn("❓ Help", callback_data="help")],
+        [Btn("❌ Close", callback_data="close")],
     ])
 
 
@@ -1423,7 +1424,38 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if "not modified" not in str(e).lower():
                 log.warning("menu edit failed: %s", e)
 
+    def _test_kb(extra=None):
+        rows = [[Btn("🔍 Connection check (surakshit)", callback_data="test_check")],
+                [Btn("📨 Test order (sacho order)", callback_data="test_ask")]]
+        if extra:
+            rows = extra
+        return Markup(rows + [[Btn("⬅️ Back", callback_data="menu")]])
+
+    TEST_HOME = ("🧪 Angel One test\n\n"
+                 "🔍 Connection check: login, funds ane order IP check. Koi order nathi jatu.\n"
+                 "📨 Test order: 1 lot BUY LIMIT ₹0.05 sacho order moklse ane turant cancel karse.")
+
     try:
+        if d == "angeltest":
+            await q.answer()
+            return await show(TEST_HOME, _test_kb())
+        if d == "test_check":
+            await q.answer("Check chalu...")
+            await show("⏳ Check chalu...", _test_kb())
+            txt = await asyncio.to_thread(_test_checks)
+            return await show(txt, _test_kb())
+        if d == "test_ask":
+            await q.answer()
+            return await show("⚠️ Aa SACHO order Angel One ma jase.\n"
+                              "ATM CE, 1 lot, BUY LIMIT ₹0.05 (fill thavani sambhavna nathi), turant cancel thase.\n"
+                              "Market band hoy to reject thase, pan connection/IP no error dekhase.\n\nChalu karvu che?",
+                              Markup([[Btn("✅ Haa, test order moklo", callback_data="test_go")],
+                                      [Btn("❌ Na", callback_data="angeltest")]]))
+        if d == "test_go":
+            await q.answer("Test order chalu...")
+            await show("⏳ Test order chalu...", _test_kb())
+            txt = await asyncio.to_thread(_test_order_roundtrip)
+            return await show(txt, _test_kb())
         if d == "noop":
             return await q.answer()
         if d == "close":
@@ -1956,6 +1988,90 @@ def kv(rows, w=9) -> str:
     return "<pre>" + "\n".join(f"{html.escape(str(k)):<{w}}{html.escape(str(v))}" for k, v in rows) + "</pre>"
 
 
+# ---------------- ANGEL ACCOUNT INFO (dashboard mate cache) ----------------
+acct = {"funds": None, "ok": None, "err": "", "t": 0.0, "ip": None, "ip_t": 0.0, "busy": False}
+
+
+def _acct_fetch():
+    """Funds + bahar nu IP lave (background thread). Dashboard ne block nathi karto."""
+    try:
+        try:
+            r = throttled(smart.rmsLimit)
+            if isinstance(r, dict) and r.get("status") and r.get("data"):
+                acct["funds"], acct["ok"], acct["err"] = r["data"], True, ""
+            else:
+                acct["ok"] = False
+                acct["err"] = str((r or {}).get("message") or r)[:70] if isinstance(r, dict) else str(r)[:70]
+        except Exception as e:
+            acct["ok"], acct["err"] = False, str(e)[:70]
+        acct["t"] = time.time()
+        if time.time() - acct["ip_t"] > 600:
+            try:
+                px = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+                acct["ip"] = requests.get("https://api.ipify.org", proxies=px, timeout=6).text.strip()
+            except Exception:
+                acct["ip"] = None
+            acct["ip_t"] = time.time()
+    finally:
+        acct["busy"] = False
+
+
+def kick_acct(max_age=60):
+    if acct["busy"] or time.time() - acct["t"] < max_age:
+        return
+    acct["busy"] = True
+    asyncio.get_running_loop().run_in_executor(None, _acct_fetch)
+
+
+def _fnum(d, *keys) -> float:
+    for k in keys:
+        try:
+            if d.get(k) not in (None, ""):
+                return float(d[k])
+        except Exception:
+            pass
+    return 0.0
+
+
+def angel_conn_status(feed_ok: bool, mkt_open: bool) -> str:
+    if not AUTH.get("jwt"):
+        return "🔴 Login nathi"
+    if acct["ok"] is False:
+        return f"🔴 API error: {acct['err']}"
+    if acct["ok"] is None:
+        return "🟡 Check thay che..."
+    age = time.time() - acct["t"]
+    if age > 180:
+        return f"🟡 Data juno ({age / 60:.0f} min)"
+    if mkt_open and not feed_ok:
+        return "🟡 Connected (live feed nathi, REST)"
+    return "🟢 Connected"
+
+
+def angel_block(feed_ok: bool, mkt_open: bool) -> list:
+    """Dashboard no Angel One section. Live ma pura details, paper ma ek line."""
+    esc = html.escape
+    if state["mode"] != "live":
+        ok = "🟢 Login chalu" if AUTH.get("jwt") else "🔴 Login nathi"
+        return [f"<b>🏦 ANGEL</b>  {ok} • <code>{esc(ANGEL_CLIENT_ID or '-')}</code> • "
+                f"<i>Paper mode (sacha orders nathi jata)</i>", ""]
+    kick_acct()
+    f = acct["funds"] or {}
+    login_age = (time.time() - _last_login[0]) / 60 if _last_login[0] else None
+    rows = [("User", ANGEL_CLIENT_ID or "-")]
+    if f:
+        rows += [("Funds", f"₹{_fnum(f, 'availablecash', 'net'):,.0f} available"),
+                 ("Margin", f"₹{_fnum(f, 'utilisedamount', 'utiliseddebits'):,.0f} used")]
+    else:
+        rows.append(("Funds", "load thay che..." if acct["ok"] is None else "n/a"))
+    rows.append(("Feed", "⚡ WS live" if feed_ok else "🌐 REST polling"))
+    if login_age is not None:
+        rows.append(("Login", f"{login_age:.0f} min pehla"))
+    if acct["ip"]:
+        rows.append(("Order IP", acct["ip"] + (" (proxy)" if PROXY_URL else "")))
+    return [f"<b>🏦 ANGEL ONE</b>  {angel_conn_status(feed_ok, mkt_open)}", kv(rows), ""]
+
+
 async def dashboard_text() -> str:
     esc = html.escape
     now = datetime.now()
@@ -1966,6 +2082,7 @@ async def dashboard_text() -> str:
     L = ["<b>📺 NIFTY SPREAD BOT</b>",
          f"{'🟢 LIVE' if mkt_open else '🔴 CLOSED'} • {'⚡ WS' if feed_ok else '🌐 REST'} • 🕒 {now:%H:%M:%S}",
          f"{now:%a %d %b} • Bot {run} • {mode}", ""]
+    L += angel_block(feed_ok, mkt_open)
 
     # ---------------- TREND ----------------
     try:
