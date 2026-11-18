@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime, time as dtime, timedelta
 
 import numpy as np
@@ -124,7 +125,7 @@ ONE_TRADE_PER_TREND = True   # profit/loss book thaya pachi same trend ma navi t
 HISTORY_DAYS = None          # None = auto (timeframe mujab). Indicator ma aagal na divas na candles ketla divas na levana
 ANGEL_MAX_DAYS = {1: 30, 3: 60, 5: 100, 10: 100, 15: 200, 30: 200}     # Angel One history limit per interval
 HISTORY_PRESETS = [2, 3, 5, 6, 8, 10, 15, 20, 30, 45, 60, 100, 200]
-LOOP_SECONDS = 20
+LOOP_SECONDS = 3            # signal/exit check kitli vaare (pehla 20 sec hatu = entry late)
 DASH_REFRESH = 2           # dashboard refresh seconds (live jevu). 2-3 sec Telegram mate safe
 IMG_REFRESH = 10          # image dashboard refresh seconds (Telegram photo edit slow/limited)
 IMG_CANDLES = 72          # image chart ma ketla candles
@@ -199,14 +200,14 @@ def relogin(force=False):
         angel_login()
 
 
-def throttled(fn, *args, retries=3, **kwargs):
+def throttled(fn, *args, retries=3, fast=False, **kwargs):
     """Angel API call: gap rakhe, 'access rate' par retry kare, ane Invalid Token (AG8001)
     aave to automatic relogin karine pacho call kare."""
     name = getattr(fn, "__name__", None)
     relogged = False
     for attempt in range(retries + 2):
-        with _api_lock:
-            wait = MIN_GAP - (time.time() - _last_call[0])
+        with (nullcontext() if fast else _api_lock):        # fast=True (orders): lock/gap vagar turant
+            wait = 0 if fast else MIN_GAP - (time.time() - _last_call[0])
             if wait > 0:
                 time.sleep(wait)
             try:
@@ -218,7 +219,8 @@ def throttled(fn, *args, retries=3, **kwargs):
             except Exception as e:
                 res, err, exc = None, _is_session_error(e), e
             finally:
-                _last_call[0] = time.time()
+                if not fast:
+                    _last_call[0] = time.time()
         if err and not relogged:
             log.warning("Session/token error (%s) -> relogin", exc or res)
             relogged = True
@@ -403,9 +405,168 @@ def place_order(opt, side, qty) -> str:
         "producttype": PRODUCT_TYPE, "duration": "DAY", "price": "0", "squareoff": "0",
         "stoploss": "0", "quantity": str(qty),
     }
-    oid = throttled(smart.placeOrder, params, retries=0)
+    oid = throttled(smart.placeOrder, params, retries=0, fast=True)
     log.info("Order %s %s %s -> %s", side, opt["symbol"], qty, oid)
+    if not oid or str(oid).lower() == "none":
+        raise RuntimeError("Angel One e order id nathi aapyo (order nathi gayo)")
     return str(oid)
+
+
+# ----------------------------- ANGEL ORDER CONFIRMATION ---------------
+def confirm_order(oid, wait=8.0) -> dict:
+    """Angel One orderBook thi order ni SACHI status + average fill price. Terminal status ke timeout sudhi poll."""
+    info = {"oid": str(oid), "status": "unknown", "avg": None, "filled": 0, "text": ""}
+    end = time.time() + wait
+    time.sleep(0.5)
+    while True:
+        try:
+            ob = throttled(smart.orderBook, fast=True)
+            rows = (ob.get("data") or []) if isinstance(ob, dict) else []
+            for o in rows:
+                if str(o.get("orderid")) == str(oid):
+                    info["status"] = str(o.get("orderstatus") or "unknown").lower()
+                    info["text"] = str(o.get("text") or "")
+                    try:
+                        info["avg"] = float(o.get("averageprice") or 0) or None
+                    except Exception:
+                        pass
+                    try:
+                        info["filled"] = int(float(o.get("filledshares") or 0))
+                    except Exception:
+                        pass
+                    break
+        except Exception as e:
+            info["text"] = f"orderbook error: {e}"
+        if info["status"] in ("complete", "rejected", "cancelled") or time.time() > end:
+            return info
+        time.sleep(0.8)
+
+
+def fill_ok(info) -> bool:
+    return bool(info) and info.get("status") == "complete"
+
+
+def _cancel_quiet(oid):
+    if not oid:
+        return
+    try:
+        throttled(smart.cancelOrder, str(oid), "NORMAL", fast=True)
+    except Exception as e:
+        log.warning("cancel %s fail: %s", oid, e)
+
+
+def live_entry_orders(hedge_opt, sell_opt, qty) -> dict:
+    """Pehla hedge BUY (fill confirm), pachhi sell leg SELL (fill confirm). Fail thay to safe rite rok."""
+    out = {"ok": False, "msg": "", "sell_px": None, "hedge_px": None, "orders": {}}
+    try:
+        h_oid = place_order(hedge_opt, "BUY", qty)
+    except Exception as e:
+        out["msg"] = f"❌ ENTRY cancel: hedge BUY order nathi gayo.\n{e}\nKoi position nathi."
+        return out
+    h_info = confirm_order(h_oid)
+    out["orders"]["hedge"] = h_info
+    if not fill_ok(h_info):
+        _cancel_quiet(h_oid)
+        out["msg"] = (f"❌ ENTRY cancel: hedge BUY #{h_oid} {h_info['status']} {h_info['text']}\n"
+                      f"Sell order moklyo nathi. Koi position nathi. (Angel One ma check karo)")
+        return out
+    try:
+        s_oid = place_order(sell_opt, "SELL", qty)
+        s_info = confirm_order(s_oid)
+    except Exception as e:
+        s_oid, s_info = None, {"oid": None, "status": "error", "avg": None, "filled": 0, "text": str(e)}
+    out["orders"]["sell"] = s_info
+    if not fill_ok(s_info):
+        _cancel_quiet(s_oid)
+        msg = f"❌ ENTRY fail: SELL leg {s_info['status']} {s_info['text']}\nHedge BUY thayelo hato, ene square-off kari rahyo chhu..."
+        try:
+            x_oid = place_order(hedge_opt, "SELL", qty)
+            x_info = confirm_order(x_oid)
+            msg += (f"\n↩️ Hedge SELL #{x_oid} {x_info['status']}" + (f" @ {x_info['avg']:.2f}" if x_info["avg"] else ""))
+            if not fill_ok(x_info):
+                msg += "\n⚠️ Hedge band na thayo! Angel One ma manually band karo."
+        except Exception as e:
+            msg += f"\n⚠️ Hedge square-off order fail: {e}\nAngel One ma manually hedge band karo!"
+        out["msg"] = msg
+        return out
+    out["sell_px"], out["hedge_px"] = s_info["avg"], h_info["avg"]
+    out["ok"] = True
+    return out
+
+
+def live_exit_orders(p) -> dict:
+    """Pehla sell leg BUY back (fill confirm), pachhi hedge SELL. Sell leg band na thay to hedge nathi vechatu."""
+    qty = p["qty"]
+    out = {"ok": False, "msg": "", "s": None, "h": None, "orders": {}, "warn": ""}
+    try:
+        s_oid = place_order(p["sell"], "BUY", qty)
+    except Exception as e:
+        out["msg"] = f"❌ EXIT fail: sell leg BUY order nathi gayo.\n{e}\nPosition haju bot ma open che. 30 sec pachhi fari try thase."
+        return out
+    s_info = confirm_order(s_oid)
+    out["orders"]["sell_exit"] = s_info
+    if not fill_ok(s_info):
+        _cancel_quiet(s_oid)
+        out["msg"] = (f"❌ EXIT fail: sell leg BUY #{s_oid} {s_info['status']} {s_info['text']}\n"
+                      f"Position haju bot ma open che (Angel One ma check karo). 30 sec pachhi fari try thase.")
+        return out
+    out["s"] = s_info["avg"] or ws_ltp(p["sell"]["token"]) or p["sell_entry"]
+    try:
+        h_oid = place_order(p["hedge"], "SELL", qty)
+        h_info = confirm_order(h_oid)
+    except Exception as e:
+        h_oid, h_info = None, {"oid": None, "status": "error", "avg": None, "filled": 0, "text": str(e)}
+    out["orders"]["hedge_exit"] = h_info
+    if fill_ok(h_info):
+        out["h"] = h_info["avg"] or ws_ltp(p["hedge"]["token"]) or p["hedge_entry"]
+    else:
+        _cancel_quiet(h_oid)
+        out["h"] = ws_ltp(p["hedge"]["token"]) or p["hedge_entry"]
+        out["warn"] = (f"⚠️ Hedge SELL {h_info['status']} {h_info['text']}\n"
+                       f"Hedge Angel One ma haju open hoi shake, manually band karo! (PnL ma hedge price andaje che)")
+    out["ok"] = True
+    return out
+
+
+def fills_text(orders, ltp_ref=None, exit_=False) -> str:
+    """Telegram mate Angel One na sacha orders ni vigat."""
+    if not orders:
+        return ""
+    names = ([("sell_exit", "BUY  (sell leg band)"), ("hedge_exit", "SELL (hedge band)")] if exit_
+             else [("hedge", "BUY  hedge"), ("sell", "SELL leg")])
+    refs = {}
+    if ltp_ref and not exit_:
+        refs = {"sell": ltp_ref[0], "hedge": ltp_ref[1]}
+    L = ["📒 Angel One orders (sacha fill)"]
+    for key, label in names:
+        i = orders.get(key)
+        if not i:
+            continue
+        ok = "✅" if i.get("status") == "complete" else "❌"
+        px = f" @ {i['avg']:.2f}" if i.get("avg") else ""
+        ref = f" (signal LTP {refs[key]:.2f})" if key in refs and refs[key] else ""
+        L.append(f"{ok} {label} #{i.get('oid')} {i.get('status')}{px}{ref}")
+    return "\n".join(L)
+
+
+def _orders_text() -> str:
+    """Aaj na Angel One orders (orderBook)."""
+    ob = throttled(smart.orderBook)
+    if not isinstance(ob, dict) or not ob.get("status"):
+        return f"❌ Orderbook nathi malyu: {ob}"
+    rows = ob.get("data") or []
+    if not rows:
+        return "📒 Angel One: aaj koi order nathi."
+    L = [f"📒 Angel One orders (aaj, {len(rows)})"]
+    for o in rows[-12:]:
+        t = str(o.get("updatetime") or o.get("exchtime") or "")[-8:]
+        px = o.get("averageprice") or o.get("price") or "0"
+        st = str(o.get("orderstatus") or "")
+        txt = f" - {str(o.get('text'))[:40]}" if st.lower() == "rejected" and o.get("text") else ""
+        L.append(f"{t} {o.get('transactiontype')} {o.get('tradingsymbol')} x{o.get('quantity')} @{px} {st}{txt}")
+    if len(rows) > 12:
+        L.append(f"... (chella 12 batavya, kul {len(rows)})")
+    return "\n".join(L)
 
 
 # ----------------------------- PERSISTENCE ----------------------------
@@ -645,6 +806,56 @@ def start_ws():
     threading.Thread(target=_ws_thread, daemon=True).start()
 
 
+_poll = {"batch": True, "warn_t": 0.0}
+
+
+def _poll_once():
+    """Je tokens na price 3 sec thi juna che (WS nathi/tick nathi) te REST thi ek j batch call ma lavo."""
+    EX = {1: "NSE", 2: "NFO"}
+    stale = {}
+    for et, toks in list(ws_wanted.items()):
+        for t in list(toks):
+            v = ws_prices.get(str(t))
+            if not v or time.time() - v[1] > 3:
+                stale.setdefault(et, []).append(str(t))
+    req = {EX[et]: toks for et, toks in stale.items() if et in EX and toks}
+    if not req:
+        return
+    if _poll["batch"]:
+        try:
+            fn = smart.getMarketData
+        except AttributeError:
+            _poll["batch"] = False         # juno smartapi version -> ltpData fallback
+        else:
+            r = throttled(fn, "LTP", req, retries=1)
+            rows = ((r or {}).get("data") or {}).get("fetched") if isinstance(r, dict) else None
+            for row in rows or []:
+                tok, px = str(row.get("symbolToken", "")).strip(), row.get("ltp")
+                if tok and px is not None:
+                    ws_prices[tok] = (float(px), time.time())
+            return
+    # fallback: Nifty + position na 2 legs (ek ek call)
+    ws_prices[NIFTY_TOKEN] = (ltp("NSE", "Nifty 50", NIFTY_TOKEN), time.time())
+    pos = state.get("position")
+    if pos:
+        for leg in (pos["sell"], pos["hedge"]):
+            ws_prices[str(leg["token"])] = (ltp("NFO", leg["symbol"], leg["token"]), time.time())
+
+
+def _price_poller():
+    while True:
+        time.sleep(1.5)
+        try:
+            now = datetime.now()
+            if smart is None or now.weekday() >= 5 or not (dtime(9, 14) <= now.time() <= dtime(15, 31)):
+                continue
+            _poll_once()
+        except Exception as e:
+            if time.time() - _poll["warn_t"] > 60:
+                _poll["warn_t"] = time.time()
+                log.warning("price poll error: %s", e)
+
+
 def ws_pnl():
     """Websocket prices thi PnL (REST call vagar). Fresh na hoy to None."""
     p = state["position"]
@@ -763,13 +974,22 @@ def current_signal():
     open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
     secs = (now - open_t).total_seconds()
     bucket = (state["strategy"], now.date(), int(secs // (60 * CANDLE_MINUTES)))
-    # candle band thaya pachi 5 sec ni rah joi ne fetch
-    ready = secs % (60 * CANDLE_MINUTES) >= 5
+    # candle band thaya pachi 2 sec ni rah joi ne fetch (Angel ma candle na aave to niche retry thase)
+    ready = secs % (60 * CANDLE_MINUTES) >= 2
     if _sig_cache["val"] is not None and (_sig_cache["bucket"] == bucket or not ready):
         return _sig_cache["val"]
     df_ = get_candles()
     _candle_cache["df"] = df_            # image chart mate
     val = compute_signal(state["strategy"], df_)
+    if bucket[2] >= 1:
+        # haju navi bandh thayeli candle Angel ma nathi aavi? to cache na karo, next tick ma fari fetch (max 8 vaar)
+        expected = pd.Timestamp(open_t + timedelta(minutes=CANDLE_MINUTES * (bucket[2] - 1)))
+        if pd.Timestamp(val[1]) < expected:
+            if _sig_cache.get("try_bucket") != bucket:
+                _sig_cache["try_bucket"], _sig_cache["tries"] = bucket, 0
+            _sig_cache["tries"] += 1
+            if _sig_cache["tries"] <= 8:
+                return val
     _sig_cache["bucket"], _sig_cache["val"] = bucket, val
     return val
 
@@ -824,28 +1044,74 @@ def pick_hedge(opt_type, atm, atm_prem, expiry):
     return best
 
 
+def pick_legs_batch(opt_type, atm, expiry):
+    """ATM + 49 hedge-candidate strikes na prices ek j API call ma. (sell_opt, sell_px, hedge_opt, hedge_px)"""
+    sign = -1 if opt_type == "PE" else 1
+    sub = scrips[(scrips["expiry_d"] == expiry) & (scrips["symbol"].str.endswith(opt_type))]
+    by_strike = {float(r.strike_f): r for r in sub.itertuples()}
+    cands = []
+    for step in range(0, 50):
+        r = by_strike.get(float(atm + sign * step * STRIKE_STEP))
+        if r is not None:
+            cands.append({"symbol": r.symbol, "token": r.token, "strike": atm + sign * step * STRIKE_STEP,
+                          "type": opt_type, "step": step})
+    if not cands or cands[0]["step"] != 0:
+        raise RuntimeError("ATM strike nathi malyo")
+    r = throttled(smart.getMarketData, "LTP", {"NFO": [c["token"] for c in cands]}, retries=1)
+    rows = ((r or {}).get("data") or {}).get("fetched") if isinstance(r, dict) else None
+    if not rows:
+        raise RuntimeError(f"batch LTP nathi malyo: {r}")
+    px = {str(x.get("symbolToken")): float(x["ltp"]) for x in rows if x.get("ltp") is not None}
+    sell = cands[0]
+    if sell["token"] not in px or px[sell["token"]] <= 0:
+        raise RuntimeError("ATM price nathi malyo")
+    sell_px = px[sell["token"]]
+    target = sell_px * HEDGE_PCT
+    pool = [c for c in cands[1:] if px.get(c["token"], 0) > 0]
+    if not pool:
+        raise RuntimeError("Hedge strike nathi malyo")
+    hedge = min(pool, key=lambda c: abs(px[c["token"]] - target))
+    strip = lambda o: {k: o[k] for k in ("symbol", "token", "strike", "type")}
+    return strip(sell), sell_px, strip(hedge), px[hedge["token"]]
+
+
 async def open_position(direction: int, app: Application):
     if state["day_halt"]:
         return                              # divas limit hit -> navi entry nahi
     opt_type = "PE" if direction == 1 else "CE"
-    spot = await asyncio.to_thread(nifty_spot)
+    t0 = time.time()
+    spot = await spot_cached()                       # WS / poller thi fast price
     atm = round(spot / STRIKE_STEP) * STRIKE_STEP
     expiry = nearest_expiry()
     qty = LOT_SIZE * LOTS
 
-    sell_opt = find_option(atm, opt_type, expiry)
-    sell_px = await asyncio.to_thread(ltp, "NFO", sell_opt["symbol"], sell_opt["token"])
-    hedge_opt, hedge_px = await asyncio.to_thread(pick_hedge, opt_type, atm, sell_px, expiry)
+    try:
+        # ek j API call ma ATM + hedge candidates (junu 6-8 calls no rasto hatu)
+        sell_opt, sell_px, hedge_opt, hedge_px = await asyncio.to_thread(pick_legs_batch, opt_type, atm, expiry)
+    except Exception as e:
+        log.warning("batch leg pick fail (%s) -> junu dhimu rasto", e)
+        sell_opt = find_option(atm, opt_type, expiry)
+        sell_px = await asyncio.to_thread(ltp, "NFO", sell_opt["symbol"], sell_opt["token"])
+        hedge_opt, hedge_px = await asyncio.to_thread(pick_hedge, opt_type, atm, sell_px, expiry)
 
     credit = sell_px - hedge_px  # per unit
     if credit <= 0:
         await notify(app, "Net credit <= 0, entry skip.")
         return
 
+    orders_info = None
+    ltp_ref = (sell_px, hedge_px)
     if state["mode"] == "live":
-        # pehla hedge BUY (margin benefit), pachi SELL
-        await asyncio.to_thread(place_order, hedge_opt, "BUY", qty)
-        await asyncio.to_thread(place_order, sell_opt, "SELL", qty)
+        # Angel One ma sacha orders: fill confirm karine j position banave, fill price vapre
+        r = await asyncio.to_thread(live_entry_orders, hedge_opt, sell_opt, qty)
+        if not r["ok"]:
+            state["last_event"] = f"{datetime.now():%H:%M} ENTRY FAIL"
+            save_state()
+            return await notify(app, r["msg"])
+        sell_px = r["sell_px"] or sell_px
+        hedge_px = r["hedge_px"] or hedge_px
+        credit = sell_px - hedge_px
+        orders_info = r["orders"]
 
     state["live_msg_id"] = None
     state["live_msg_t"] = 0.0
@@ -854,6 +1120,7 @@ async def open_position(direction: int, app: Application):
         "sell": sell_opt, "sell_entry": sell_px,
         "hedge": hedge_opt, "hedge_entry": hedge_px,
         "credit": credit,
+        "orders": orders_info, "ltp_ref": list(ltp_ref),
         "sl": -calc_limit(SL_MODE, SL_VALUE, credit, qty),
         "tp": calc_limit(TP_MODE, TP_VALUE, credit, qty),
         "sl_txt": limit_text(SL_MODE, SL_VALUE), "tp_txt": limit_text(TP_MODE, TP_VALUE),
@@ -862,6 +1129,7 @@ async def open_position(direction: int, app: Application):
         "entry_dt": datetime.now().isoformat(timespec="seconds"),
     }
     ws_subscribe(2, [sell_opt["token"], hedge_opt["token"]])
+    entry_secs = time.time() - t0
     state["last_event"] = f"{datetime.now():%H:%M} ENTRY {opt_type} spread"
     save_state()
     await notify(app,
@@ -871,7 +1139,9 @@ async def open_position(direction: int, app: Application):
         f"Expiry: {expiry:%d %b %Y} ({EXPIRY_MODES[EXPIRY_MODE].split(' (')[0]})\n"
         f"Lots: {LOTS} | Qty: {qty} | Net credit/unit: {credit:.2f}\n"
         f"🛡 SL: -₹{abs(state['position']['sl']):,.0f} ({state['position']['sl_txt']})\n"
-        f"🎯 Target: +₹{state['position']['tp']:,.0f} ({state['position']['tp_txt']})")
+        f"🎯 Target: +₹{state['position']['tp']:,.0f} ({state['position']['tp_txt']})\n"
+        f"⏱ Entry prep + orders: {entry_secs:.1f}s"
+        + (("\n" + fills_text(orders_info, ltp_ref)) if orders_info else ""))
 
 
 async def position_pnl():
@@ -900,10 +1170,18 @@ async def _close_position(app: Application, reason: str):
         return
     pnl, s, h = await position_pnl()
     mode = p.get("mode", state["mode"])
+    live_txt = ""
     if mode == "live":
-        # pehla sell leg buy back, pachi hedge sell
-        await asyncio.to_thread(place_order, p["sell"], "BUY", p["qty"])
-        await asyncio.to_thread(place_order, p["hedge"], "SELL", p["qty"])
+        if time.time() < state.get("exit_block_t", 0):
+            return                                   # pehla exit fail thayo, thodi vaar ruko
+        r = await asyncio.to_thread(live_exit_orders, p)
+        if not r["ok"]:
+            state["exit_block_t"] = time.time() + 30
+            return await notify(app, r["msg"])
+        # Angel One na sacha fill price thi PnL
+        s, h = r["s"], r["h"]
+        pnl = ((p["sell_entry"] - s) + (h - p["hedge_entry"])) * p["qty"]
+        live_txt = "\n" + fills_text(r["orders"], exit_=True) + (("\n" + r["warn"]) if r["warn"] else "")
     state["realized_pnl"] += pnl
     try:
         exit_spot = await spot_cached(5)
@@ -922,7 +1200,7 @@ async def _close_position(app: Application, reason: str):
     if ONE_TRADE_PER_TREND and "flip" not in reason.lower():
         extra = "\n⏸ Same trend ma navi trade nahi, trend flip ni rah."
     await notify(app, f"🔴 EXIT [{mode.upper()}]\n{trade_block(trade)}\n"
-                      f"Day PnL: {money(state['realized_pnl'])}{extra}")
+                      f"Day PnL: {money(state['realized_pnl'])}{extra}{live_txt}")
     lim = day_limit_reason(state["realized_pnl"])
     if lim:
         await set_day_halt(app, lim)
@@ -1221,8 +1499,8 @@ def main_menu_kb() -> Markup:
         [Btn("🚪 Exit Position", callback_data="exit")],
         [Btn("📝 Paper Mode", callback_data="mode_paper"), Btn("⚡ Live Mode", callback_data="mode_live")],
         [Btn("⚙️ Settings", callback_data="settings"), Btn("🧪 Angel Test", callback_data="angeltest")],
-        [Btn("🔄 Refresh", callback_data="menu"), Btn("❓ Help", callback_data="help")],
-        [Btn("❌ Close", callback_data="close")],
+        [Btn("🔄 Refresh", callback_data="menu"), Btn("📒 Angel Orders", callback_data="angelorders")],
+        [Btn("❓ Help", callback_data="help"), Btn("❌ Close", callback_data="close")],
     ])
 
 
@@ -1436,6 +1714,11 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "📨 Test order: 1 lot BUY LIMIT ₹0.05 sacho order moklse ane turant cancel karse.")
 
     try:
+        if d == "angelorders":
+            await q.answer("Angel thi orders lai rahyo...")
+            txt = await asyncio.to_thread(_orders_text)
+            return await show(txt, Markup([[Btn("🔄 Refresh", callback_data="angelorders")],
+                                           [Btn("⬅️ Back", callback_data="menu")]]))
         if d == "angeltest":
             await q.answer()
             return await show(TEST_HOME, _test_kb())
@@ -1850,6 +2133,12 @@ def _test_order_roundtrip() -> str:
     return "\n".join(lines)
 
 
+async def cmd_orders(update: Update, ctx):
+    if not authorized(update):
+        return
+    await update.message.reply_text(await asyncio.to_thread(_orders_text))
+
+
 async def cmd_testorder(update: Update, ctx):
     if not authorized(update):
         return
@@ -1916,6 +2205,7 @@ async def post_init(app: Application):
         BotCommand("expiry", "📅 Expiry select (weekly/monthly)"),
         BotCommand("daylimit", "🛑 Daily profit/loss limit"),
         BotCommand("testorder", "🧪 Angel One connection / order test"),
+        BotCommand("orders", "📒 Angel One aaj na orders"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -1942,7 +2232,7 @@ def pbar(pnl, lo, hi, n=10) -> str:
     return "▓" * f + "░" * (n - f)
 
 
-async def spot_cached(max_age=15):
+async def spot_cached(max_age=3):
     w = ws_ltp(NIFTY_TOKEN)
     if w is not None:
         return w
@@ -1954,7 +2244,7 @@ async def spot_cached(max_age=15):
     return v
 
 
-async def pnl_cached(max_age=15):
+async def pnl_cached(max_age=3):
     r = ws_pnl()
     if r is not None:
         return r
@@ -2140,6 +2430,11 @@ async def dashboard_text() -> str:
             L.append(f"<pre>{table}</pre>")
             L.append(f"SELL <code>{esc(p['sell']['symbol'])}</code>")
             L.append(f"BUY  <code>{esc(p['hedge']['symbol'])}</code>")
+            if p.get("orders"):
+                o_ = p["orders"]
+                L.append("📒 Angel: " + " • ".join(
+                    f"{lab} #{(o_.get(k) or {}).get('oid')} {'✅' if (o_.get(k) or {}).get('status') == 'complete' else '❌'}"
+                    for k, lab in (("sell", "SELL"), ("hedge", "BUY")) if o_.get(k)))
             L.append("")
             L.append(f"{'🟢' if pnl >= 0 else '🔴'} <b>Open PnL {money(pnl)}</b>  ({pct:+.0f}%)")
             to_tp = max(0.0, pnl) / p["tp"] if p["tp"] else 0
@@ -2890,12 +3185,13 @@ def main():
     angel_login()
     load_scrips()
     start_ws()
+    threading.Thread(target=_price_poller, daemon=True).start()   # WS na chale to pan prices fast rahe
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     for name, fn in [("start", cmd_start), ("run", cmd_run), ("stop", cmd_stop), ("mode", cmd_mode),
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("image", cmd_image), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("image", cmd_image), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_button))
