@@ -545,24 +545,152 @@ def fills_text(orders, ltp_ref=None, exit_=False) -> str:
     return "\n".join(L)
 
 
-def _orders_text() -> str:
-    """Aaj na Angel One orders (orderBook)."""
+_chg_cache = {"sig": None, "t": 0.0, "val": None}
+
+
+def _flatten_breakup(items, out):
+    for it in items or []:
+        sub = it.get("breakup") or []
+        if sub:
+            _flatten_breakup(sub, out)
+            continue
+        try:
+            amt = float(it.get("amount") or 0)
+        except Exception:
+            amt = 0.0
+        if amt:
+            nm = str(it.get("name") or "?")
+            out[nm] = out.get(nm, 0.0) + amt
+
+
+def fetch_charges(orders: list):
+    """Angel One Brokerage Calculator (estimateCharges) thi executed orders na charges.
+    orders: [{'side','symbol','token','qty','price'}]. Return (total, breakup_dict) athva (None, error_text)."""
+    if not orders:
+        return 0.0, {}
+    try:
+        smart.estimateCharges
+    except AttributeError:
+        return None, "smartapi version ma estimateCharges nathi (pip install -U smartapi-python)"
+    total, brk, last_err = 0.0, {}, ""
+    for i in range(0, len(orders), 10):
+        chunk, done = orders[i:i + 10], False
+        # Angel API na format ma thodi chokkas nathi -> 3 variant try kare
+        for sym_mode, int_price in (("under", False), ("full", False), ("under", True)):
+            params = {"orders": [{
+                "product_type": PRODUCT_TYPE, "transaction_type": o["side"], "quantity": str(int(o["qty"])),
+                "price": str(int(round(o["price"]))) if int_price else f"{o['price']:.2f}",
+                "exchange": "NFO", "symbol_name": "NIFTY" if sym_mode == "under" else o["symbol"],
+                "token": str(o["token"])} for o in chunk]}
+            try:
+                r = throttled(smart.estimateCharges, params, retries=1)
+            except Exception as e:
+                last_err = str(e)[:80]
+                continue
+            d = (r or {}).get("data") if isinstance(r, dict) else None
+            if not (isinstance(r, dict) and r.get("status") and d):
+                last_err = str((r or {}).get("message") or r)[:80] if isinstance(r, dict) else str(r)[:80]
+                continue
+            summ = d.get("summary") or d
+            part = {}
+            _flatten_breakup(summ.get("breakup") or d.get("breakup") or [], part)
+            try:
+                tc = float(summ.get("total_charges"))
+            except Exception:
+                tc = sum(part.values())
+            total += tc
+            for k, v in part.items():
+                brk[k] = brk.get(k, 0.0) + v
+            done = True
+            break
+        if not done:
+            return None, last_err or "charges nathi malya"
+    return total, brk
+
+
+def _chg_line(brk: dict) -> str:
+    top = sorted(brk.items(), key=lambda kv: -kv[1])[:6]
+    return " • ".join(f"{k.replace('Angel One ', '')} {v:,.2f}" for k, v in top)
+
+
+def _orders_pages(max_len=3400) -> list:
+    """Aaj na badha Angel One orders + niche summary (buy/sell value, charges, net)."""
     ob = throttled(smart.orderBook)
     if not isinstance(ob, dict) or not ob.get("status"):
-        return f"❌ Orderbook nathi malyu: {ob}"
+        return [f"❌ Orderbook nathi malyu: {ob}"]
     rows = ob.get("data") or []
     if not rows:
-        return "📒 Angel One: aaj koi order nathi."
-    L = [f"📒 Angel One orders (aaj, {len(rows)})"]
-    for o in rows[-12:]:
+        return ["📒 Angel One: aaj koi order nathi."]
+    ICON = {"complete": "✅", "rejected": "❌", "cancelled": "⏹", "open": "⏳", "trigger pending": "⏳"}
+
+    def fl(x):
+        try:
+            return float(x or 0)
+        except Exception:
+            return 0.0
+
+    lines, cnt = [], {}
+    buy_v = sell_v = buy_q = sell_q = 0.0
+    execd = []
+    for i, o in enumerate(rows, 1):
+        st = str(o.get("orderstatus") or "").lower()
+        cnt[st] = cnt.get(st, 0) + 1
         t = str(o.get("updatetime") or o.get("exchtime") or "")[-8:]
-        px = o.get("averageprice") or o.get("price") or "0"
-        st = str(o.get("orderstatus") or "")
-        txt = f" - {str(o.get('text'))[:40]}" if st.lower() == "rejected" and o.get("text") else ""
-        L.append(f"{t} {o.get('transactiontype')} {o.get('tradingsymbol')} x{o.get('quantity')} @{px} {st}{txt}")
-    if len(rows) > 12:
-        L.append(f"... (chella 12 batavya, kul {len(rows)})")
-    return "\n".join(L)
+        side = str(o.get("transactiontype") or "").upper()
+        avg, filled = fl(o.get("averageprice")), fl(o.get("filledshares"))
+        px = avg or fl(o.get("price"))
+        txt = f" - {str(o.get('text'))[:38]}" if st == "rejected" and o.get("text") else ""
+        lines.append(f"{i}. {t} {side} {_strike_txt(o.get('tradingsymbol'))} x{o.get('quantity')} "
+                     f"@{px:.2f} {ICON.get(st, '❔')}{txt}")
+        if filled > 0 and avg > 0:
+            if side == "BUY":
+                buy_v, buy_q = buy_v + avg * filled, buy_q + filled
+            else:
+                sell_v, sell_q = sell_v + avg * filled, sell_q + filled
+            execd.append({"side": side, "symbol": o.get("tradingsymbol"), "token": o.get("symboltoken"),
+                          "qty": filled, "price": avg, "oid": o.get("orderid")})
+    # ---- summary ----
+    done_, rej, can = cnt.get("complete", 0), cnt.get("rejected", 0), cnt.get("cancelled", 0)
+    other = len(rows) - done_ - rej - can
+    S = [LINE, "📊 AAJ NO SUMMARY",
+         f"Orders: {len(rows)}  (✅ {done_} | ❌ {rej} | ⏹ {can}" + (f" | ⏳ {other}" if other else "") + ")",
+         f"Buy : ₹{buy_v:,.0f}  ({buy_q:g} qty)",
+         f"Sell: ₹{sell_v:,.0f}  ({sell_q:g} qty)"]
+    gross = sell_v - buy_v
+    note = "  (open position/adhuri qty, final nathi)" if (state.get("position") or abs(buy_q - sell_q) > 0.5) else ""
+    S.append(f"Gross: {money(gross)}{note}")
+    sig = tuple((e["oid"], e["qty"], e["price"]) for e in execd)
+    if _chg_cache["sig"] == sig and time.time() - _chg_cache["t"] < 60:
+        res = _chg_cache["val"]
+    else:
+        res = fetch_charges(execd) if execd else (0.0, {})
+        if res[0] is not None:
+            _chg_cache.update(sig=sig, t=time.time(), val=res)
+    if res[0] is None:
+        S.append(f"💸 Charges: Angel thi nathi malya ({res[1]})")
+    else:
+        S.append(f"💸 Charges (Angel est.): ₹{res[0]:,.2f}")
+        if res[1]:
+            S.append("   " + _chg_line(res[1]))
+        S.append(f"💰 Net after charges: {money(gross - res[0])}{note}")
+    # ---- pages (summary hamesha chhelle) ----
+    head = f"📒 Angel One orders • aaj ({len(rows)})"
+    pages, cur = [], [head]
+    for ln in lines:
+        if sum(len(x) + 1 for x in cur) + len(ln) > max_len:
+            pages.append("\n".join(cur))
+            cur = [f"{head} (chalu)"]
+        cur.append(ln)
+    summ_txt = "\n".join(S)
+    if sum(len(x) + 1 for x in cur) + len(summ_txt) > 4000:
+        pages.append("\n".join(cur))
+        cur = []
+    pages.append("\n".join(cur + [summ_txt]) if cur else summ_txt)
+    return pages
+
+
+def _orders_text() -> str:
+    return "\n\n".join(_orders_pages())
 
 
 # ----------------------------- PERSISTENCE ----------------------------
@@ -577,7 +705,8 @@ HISTORY_COLS = ["date", "entry_time", "exit_time", "duration_min", "mode", "stra
                 "sell_symbol", "sell_entry", "sell_exit", "sell_pnl",
                 "hedge_symbol", "hedge_entry", "hedge_exit", "hedge_pnl",
                 "net_credit_pts", "net_exit_pts", "net_points", "pnl", "sl_rule", "tp_rule", "reason",
-                "price_src", "sell_entry_oid", "hedge_entry_oid", "sell_exit_oid", "hedge_exit_oid"]
+                "price_src", "sell_entry_oid", "hedge_entry_oid", "sell_exit_oid", "hedge_exit_oid",
+                "charges", "net_pnl"]
 _last_save = [0.0]
 restore_notes = []
 
@@ -1173,7 +1302,7 @@ async def _close_position(app: Application, reason: str):
     pnl, s, h = await position_pnl()
     mode = p.get("mode", state["mode"])
     live_txt = ""
-    exit_orders, est = None, False
+    exit_orders, est, charges = None, False, None
     if mode == "live":
         if time.time() < state.get("exit_block_t", 0):
             return                                   # pehla exit fail thayo, thodi vaar ruko
@@ -1186,12 +1315,34 @@ async def _close_position(app: Application, reason: str):
         exit_orders, est = r["orders"], bool(r["warn"])
         pnl = ((p["sell_entry"] - s) + (h - p["hedge_entry"])) * p["qty"]
         live_txt = "\n" + fills_text(r["orders"], exit_=True) + (("\n" + r["warn"]) if r["warn"] else "")
+        # ---- charges Angel One (estimateCharges) thi: 4 executed orders na fill price par ----
+        try:
+            eo_, xo_ = p.get("orders") or {}, r["orders"]
+            q_ = p["qty"]
+            olist = []
+            for side_, leg_, info_, fb_ in (("BUY", p["hedge"], eo_.get("hedge"), p["hedge_entry"]),
+                                            ("SELL", p["sell"], eo_.get("sell"), p["sell_entry"]),
+                                            ("BUY", p["sell"], xo_.get("sell_exit"), s),
+                                            ("SELL", p["hedge"], xo_.get("hedge_exit"), h)):
+                if info_ is not None or side_:
+                    px_ = (info_ or {}).get("avg") or fb_
+                    if px_:
+                        olist.append({"side": side_, "symbol": leg_["symbol"], "token": leg_["token"], "qty": q_, "price": px_})
+            if eo_:
+                ch = await asyncio.wait_for(asyncio.to_thread(fetch_charges, olist), timeout=8)
+                if ch[0] is not None:
+                    charges = ch[0]
+                    live_txt += f"\n💸 Charges (Angel est.): ₹{charges:,.2f} → Net {money(pnl - charges)}"
+                else:
+                    live_txt += f"\n💸 Charges: Angel thi nathi malya ({ch[1]})"
+        except Exception as e:
+            log.warning("charges fetch fail: %s", e)
     state["realized_pnl"] += pnl
     try:
         exit_spot = await spot_cached(5)
     except Exception:
         exit_spot = None
-    trade = build_trade_record(p, s, h, pnl, reason, mode, exit_spot, exit_orders, est)
+    trade = build_trade_record(p, s, h, pnl, reason, mode, exit_spot, exit_orders, est, charges)
     state["trades"].append(trade)
     append_history(trade)
     state["last_event"] = f"{datetime.now():%H:%M} {reason} (₹{pnl:,.0f})"
@@ -1720,9 +1871,14 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         if d == "angelorders":
             await q.answer("Angel thi orders lai rahyo...")
-            txt = await asyncio.to_thread(_orders_text)
-            return await show(txt, Markup([[Btn("🔄 Refresh", callback_data="angelorders")],
-                                           [Btn("⬅️ Back", callback_data="menu")]]))
+            pages = await asyncio.to_thread(_orders_pages)
+            kb_ = Markup([[Btn("🔄 Refresh", callback_data="angelorders")], [Btn("⬅️ Back", callback_data="menu")]])
+            if len(pages) == 1:
+                return await show(pages[0], kb_)
+            await show(pages[0], None)
+            for i_, pg in enumerate(pages[1:], 1):
+                await q.message.reply_text(pg, reply_markup=kb_ if i_ == len(pages) - 1 else None)
+            return
         if d == "angeltest":
             await q.answer()
             return await show(TEST_HOME, _test_kb())
@@ -2135,7 +2291,8 @@ def _test_order_roundtrip() -> str:
 async def cmd_orders(update: Update, ctx):
     if not authorized(update):
         return
-    await update.message.reply_text(await asyncio.to_thread(_orders_text))
+    for pg in await asyncio.to_thread(_orders_pages):
+        await update.message.reply_text(pg)
 
 
 async def cmd_testorder(update: Update, ctx):
@@ -2361,6 +2518,14 @@ def angel_block(feed_ok: bool, mkt_open: bool) -> list:
     return [f"<b>🏦 ANGEL ONE</b>  {angel_conn_status(feed_ok, mkt_open)}", kv(rows), ""]
 
 
+def _chg_row(tr, total) -> list:
+    """Aaj na live trades na Angel charges (hoy to) - dashboard TODAY ma."""
+    cs = [float(t.get("charges")) for t in tr if t.get("charges") not in (None, "")]
+    if not cs:
+        return []
+    return [("Charges", f"₹{sum(cs):,.0f} • Net {money(total - sum(cs))}")]
+
+
 async def dashboard_text() -> str:
     esc = html.escape
     now = datetime.now()
@@ -2467,7 +2632,7 @@ async def dashboard_text() -> str:
         ("Best", money(best)),
         ("Worst", money(worst)),
         ("Last", state["last_event"]),
-    ]))
+    ] + _chg_row(tr, total)))
     L.append(f"<i>🛡 SL {limit_short(SL_MODE, SL_VALUE)} • 🎯 TP {limit_short(TP_MODE, TP_VALUE)} • Hedge {HEDGE_PCT * 100:.0f}% • "
              f"Lots {LOTS} • 🕒 {ENTRY_START:%H:%M}-{LAST_ENTRY:%H:%M} (exit {FORCE_EXIT:%H:%M}) • ♻️ {DASH_REFRESH}s</i>")
     return "\n".join(L)
@@ -2694,7 +2859,7 @@ def _exp_txt(e) -> str:
 
 
 def build_trade_record(p: dict, s: float, h: float, pnl: float, reason: str, mode: str, exit_spot,
-                       exit_orders=None, est=False) -> dict:
+                       exit_orders=None, est=False, charges=None) -> dict:
     now = datetime.now()
     qty = p["qty"]
     lots = p.get("lots") or max(1, round(qty / LOT_SIZE))
@@ -2712,6 +2877,8 @@ def build_trade_record(p: dict, s: float, h: float, pnl: float, reason: str, mod
     oid = lambda d_, k: (d_.get(k) or {}).get("oid") or ""
     angel = mode == "live" and bool(eo)
     return {
+        "charges": round(charges, 2) if charges is not None else "",
+        "net_pnl": round(pnl - charges, 2) if charges is not None else "",
         "price_src": ("angel+est" if est else "angel") if angel else "ltp",
         "sell_entry_oid": oid(eo, "sell"), "hedge_entry_oid": oid(eo, "hedge"),
         "sell_exit_oid": oid(xo, "sell_exit"), "hedge_exit_oid": oid(xo, "hedge_exit"),
@@ -2766,6 +2933,9 @@ def trade_block(r: dict, num=None) -> str:
                                                         ("sell_exit_oid", "S-exit"), ("hedge_exit_oid", "B-exit")) if r.get(k))
         L.append("📒 Angel fill prices" + (" (hedge exit andaje)" if src == "angel+est" else "") + (f" | {ids}" if ids else ""))
     L.append(f"💰 Net PnL: {money(pnl)}  [{r.get('reason', '')}]")
+    ch_ = fnum(r, "charges")
+    if ch_ is not None:
+        L.append(f"💸 Charges (Angel est.): ₹{ch_:,.2f} → After charges {money(pnl - ch_)}")
     if r.get("sl_rule"):
         L.append(f"SL: {r['sl_rule']} | TP: {r.get('tp_rule', '')}")
     return "\n".join(L)
@@ -2808,6 +2978,10 @@ def stats_text(rows: list, title: str, daywise: bool = False) -> str:
          f"Avg time: {f'{sum(durs) / len(durs):.0f} min' if durs else '-'}",
          f"Lots: {lots_total:g} (Qty {qty_total:g})",
          f"Net points: {f'{sum(pts):+.1f}' if pts else '-'}"]
+    chs = [c for c in (fnum(r, "charges") for r in rows) if c is not None]
+    if chs:
+        L.append(f"💸 Charges (Angel est.): ₹{sum(chs):,.2f}  ({len(chs)} live trades)")
+        L.append(f"💰 Net after charges: {money(net - sum(chs))}")
 
     def group(keyf, label):
         g = {}
