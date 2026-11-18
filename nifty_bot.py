@@ -1760,6 +1760,81 @@ async def cmd_daylimit(update: Update, ctx):
     await update.message.reply_text("✅ " + day_limit_text())
 
 
+def _test_checks() -> str:
+    """Read-only check: login, funds, bahar nu IP. Koi order nathi jatu."""
+    out = []
+    out.append("✅ Angel login: chalu" if AUTH.get("jwt") else "❌ Angel login: token nathi")
+    try:
+        r = throttled(smart.rmsLimit)
+        if isinstance(r, dict) and r.get("status") and r.get("data"):
+            d = r["data"]
+            out.append(f"💰 Available cash: ₹{float(d.get('availablecash', 0)):,.0f}")
+        else:
+            out.append(f"❌ Funds check fail: {r}")
+    except Exception as e:
+        out.append(f"❌ Funds check fail: {e}")
+    try:
+        px = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+        ip = requests.get("https://api.ipify.org", proxies=px, timeout=10).text.strip()
+        out.append(f"🌐 Orders aa IP thi jase: {ip}" + (" (proxy)" if PROXY_URL else " (proxy nathi)"))
+        out.append("   Aa IP Angel One SmartAPI ma register hovo joie.")
+    except Exception as e:
+        out.append(f"❌ IP check fail: {e}")
+    return "\n".join(out)
+
+
+def _test_order_roundtrip() -> str:
+    """Sacho order test: ATM CE nu 1 lot BUY LIMIT @ ₹0.05 (fill nahi thay), pachhi turant cancel."""
+    spot = nifty_spot()
+    atm = round(spot / STRIKE_STEP) * STRIKE_STEP
+    opt = find_option(atm, "CE", nearest_expiry())
+    params = {"variety": "NORMAL", "tradingsymbol": opt["symbol"], "symboltoken": opt["token"],
+              "transactiontype": "BUY", "exchange": "NFO", "ordertype": "LIMIT",
+              "producttype": PRODUCT_TYPE, "duration": "DAY", "price": "0.05", "squareoff": "0",
+              "stoploss": "0", "quantity": str(LOT_SIZE)}
+    lines = [f"Test order: BUY {opt['symbol']} x{LOT_SIZE} LIMIT ₹0.05"]
+    try:
+        oid = throttled(smart.placeOrder, params, retries=0)
+    except Exception as e:
+        lines.append(f"❌ Order place fail: {e}")
+        lines.append("(IP/token/margin/market-closed jevo error hoy to upar dekhase)")
+        return "\n".join(lines)
+    lines.append(f"✅ Angel One e order swikaryo. Order ID: {oid}")
+    time.sleep(2)
+    status = "?"
+    try:
+        ob = throttled(smart.orderBook)
+        for o in (ob.get("data") or []):
+            if str(o.get("orderid")) == str(oid):
+                status = f"{o.get('orderstatus')} {o.get('text') or ''}".strip()
+    except Exception as e:
+        status = f"orderbook error: {e}"
+    lines.append(f"📋 Status: {status}")
+    try:
+        c = throttled(smart.cancelOrder, str(oid), "NORMAL")
+        lines.append(f"🧹 Cancel: {c}")
+    except Exception as e:
+        lines.append(f"⚠️ Cancel na thayu ({e}). Angel One app ma jai ne order {oid} cancel karo!")
+    return "\n".join(lines)
+
+
+async def cmd_testorder(update: Update, ctx):
+    if not authorized(update):
+        return
+    arg = ctx.args[0].lower() if ctx.args else ""
+    if arg == "order":
+        if not ctx.args[1:] or ctx.args[1].lower() != "yes":
+            return await update.message.reply_text(
+                "⚠️ Aa SACHO order Angel One ma jase (1 lot BUY LIMIT ₹0.05, fill thavani sambhavna nathi, "
+                "turant cancel thase).\nMarket band hoy to reject thase, pan connection/IP no error dekhase.\n\n"
+                "Chalu karva: /testorder order yes")
+        await update.message.reply_text("⏳ Test order chalu...")
+        return await update.message.reply_text(await asyncio.to_thread(_test_order_roundtrip))
+    await update.message.reply_text("⏳ Check chalu...")
+    txt = await asyncio.to_thread(_test_checks)
+    await update.message.reply_text(txt + "\n\nSacho order test mate: /testorder order")
+
+
 async def cmd_sl(update: Update, ctx):
     await _cmd_limit(update, ctx, "sl")
 
@@ -1808,6 +1883,7 @@ async def post_init(app: Application):
         BotCommand("export", "📥 History CSV file"),
         BotCommand("expiry", "📅 Expiry select (weekly/monthly)"),
         BotCommand("daylimit", "🛑 Daily profit/loss limit"),
+        BotCommand("testorder", "🧪 Angel One connection / order test"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -2702,7 +2778,7 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("image", cmd_image), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("image", cmd_image), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_button))
