@@ -52,6 +52,17 @@ ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
 ANGEL_CLIENT_ID = os.getenv("ANGEL_CLIENT_ID", "")
 ANGEL_PIN = os.getenv("ANGEL_PIN", "")
 ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
+# Static IP proxy (optional). Format: http://user:pass@host:port   (Railway Variables ma PROXY_URL set karo)
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+if not PROXY_URL and os.getenv("STATICIP_HOST", "").strip():
+    # STATICIP_HOST / _PORT / _USER(NAME) / _PASS(WORD) thi proxy URL banavo
+    from urllib.parse import quote as _q
+    _h = os.getenv("STATICIP_HOST", "").strip()
+    _p = os.getenv("STATICIP_PORT", "").strip()
+    _u = (os.getenv("STATICIP_USER") or os.getenv("STATICIP_USERNAME") or "").strip()
+    _w = (os.getenv("STATICIP_PASS") or os.getenv("STATICIP_PASSWORD") or "").strip()
+    _auth = f"{_q(_u, safe='')}:{_q(_w, safe='')}@" if _u else ""
+    PROXY_URL = f"http://{_auth}{_h}{(':' + _p) if _p and ':' not in _h else ''}"
 
 ST_PERIOD = 10
 ST_MULT = 4.0
@@ -105,6 +116,10 @@ EXPIRY_MODE = "w1"            # kai expiry ma trade: w1/w2/w3 = weekly, m1/m2 = 
 EXPIRY_SKIP_TODAY = False     # True: expiry day par aajni expiry chhodi ne next expiry vapro
 EXPIRY_MODES = {"w1": "Weekly 1 (nearest)", "w2": "Weekly 2 (next)", "w3": "Weekly 3",
                 "m1": "Monthly (current)", "m2": "Monthly (next)"}
+DAY_LIMIT_ON = False          # divas nu profit/loss limit ON/OFF (Telegram Settings ma thi badlay)
+DAY_LOSS_LIMIT = 2000.0       # ₹ - divas no total loss aatlo thay to aaj nu trading band
+DAY_PROFIT_LIMIT = 3000.0     # ₹ - divas no total profit aatlo thay to aaj nu trading band
+DAY_LIMIT_STEP = 500.0
 ONE_TRADE_PER_TREND = True   # profit/loss book thaya pachi same trend ma navi trade nahi (trend flip ni rah)
 HISTORY_DAYS = None          # None = auto (timeframe mujab). Indicator ma aagal na divas na candles ketla divas na levana
 ANGEL_MAX_DAYS = {1: 30, 3: 60, 5: 100, 10: 100, 15: 200, 30: 200}     # Angel One history limit per interval
@@ -139,6 +154,8 @@ state = {
     "dash_t": 0.0,
     "mode": "paper",       # paper | live
     "running": False,
+    "day_halt": None,      # divas limit hit thayu to reason (aaj nu trading band)
+    "limit_override": False,  # True = aaj mate limit ignore (user e Resume karyu)
     "position": None,      # dict
     "realized_pnl": 0.0,
     "last_signal_candle": None,
@@ -246,6 +263,13 @@ def angel_login():
     for i in range(3):
         try:
             s_ = SmartConnect(api_key=ANGEL_API_KEY)
+            if PROXY_URL:
+                # badha Angel REST calls (login, candles, orders) static IP proxy thi jase
+                px = {"http": PROXY_URL, "https": PROXY_URL}
+                try:
+                    s_.reqsession.proxies.update(px)
+                except Exception:
+                    s_ = SmartConnect(api_key=ANGEL_API_KEY, proxies=px)
             totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
             data = s_.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp)
             if not data.get("status"):
@@ -258,6 +282,13 @@ def angel_login():
                 log.warning("feed token nathi malyo: %s", e)
             _last_login[0] = time.time()
             log.info("Angel login OK")
+            if PROXY_URL:
+                try:
+                    ip = requests.get("https://api.ipify.org", proxies={"http": PROXY_URL, "https": PROXY_URL},
+                                      timeout=10).text.strip()
+                    log.info("Proxy thi bahar nu IP: %s (aa j IP Angel One ma register hovo joie)", ip)
+                except Exception as e:
+                    log.warning("Proxy IP check fail: %s", e)
             # websocket ne navo token male e mate junu connection band karo (thread auto reconnect kare che)
             try:
                 sws = ws_ctl.get("sws")
@@ -398,8 +429,11 @@ def save_state():
         data = {
             "day": str(state["day"]) if state["day"] else str(datetime.now().date()),
             "mode": state["mode"],
+            "running": state["running"],
             "strategy": state["strategy"],
             "blocked_dir": state["blocked_dir"],
+            "day_halt": state["day_halt"],
+            "limit_override": state["limit_override"],
             "realized_pnl": state["realized_pnl"],
             "trades": state["trades"],
             "position": state["position"],
@@ -410,7 +444,9 @@ def save_state():
                          "FORCE_EXIT": FORCE_EXIT.strftime("%H:%M"),
                          "ONE_TRADE_PER_TREND": ONE_TRADE_PER_TREND, "HISTORY_DAYS": HISTORY_DAYS,
                          "EXPIRY_MODE": EXPIRY_MODE, "EXPIRY_SKIP_TODAY": EXPIRY_SKIP_TODAY,
-                         "CANDLE_MINUTES": CANDLE_MINUTES},
+                         "CANDLE_MINUTES": CANDLE_MINUTES,
+                         "DAY_LIMIT_ON": DAY_LIMIT_ON, "DAY_LOSS_LIMIT": DAY_LOSS_LIMIT,
+                         "DAY_PROFIT_LIMIT": DAY_PROFIT_LIMIT},
         }
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -458,6 +494,7 @@ def read_history():
 def load_state():
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
     global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -477,6 +514,9 @@ def load_state():
         SL_MODE, SL_VALUE = "pct", float(st["SL_PCT"]) * 100
         TP_MODE, TP_VALUE = "pct", float(st.get("TARGET_PCT", 0.5)) * 100
     EXIT_ON_FLIP = bool(st.get("EXIT_ON_FLIP", EXIT_ON_FLIP))
+    DAY_LIMIT_ON = bool(st.get("DAY_LIMIT_ON", DAY_LIMIT_ON))
+    DAY_LOSS_LIMIT = float(st.get("DAY_LOSS_LIMIT", DAY_LOSS_LIMIT))
+    DAY_PROFIT_LIMIT = float(st.get("DAY_PROFIT_LIMIT", DAY_PROFIT_LIMIT))
 
     def _t(key, cur):
         try:
@@ -493,6 +533,9 @@ def load_state():
     if tfm in TIMEFRAMES:
         set_timeframe(tfm)
     state["mode"] = d.get("mode", "paper")
+    if d.get("running"):
+        state["running"] = True
+        restore_notes.append(f"▶️ Bot pachho RUNNING ({state['mode'].upper()} mode) - /stop thi band karo.")
     if d.get("strategy") in STRATEGIES:
         state["strategy"] = d["strategy"]
     state["last_event"] = d.get("last_event", "—")
@@ -500,6 +543,8 @@ def load_state():
     if d.get("day") == str(today):
         state["trades"] = d.get("trades", [])
         state["blocked_dir"] = d.get("blocked_dir")
+        state["day_halt"] = d.get("day_halt")
+        state["limit_override"] = bool(d.get("limit_override", False))
         state["realized_pnl"] = float(d.get("realized_pnl", 0))
         if state["trades"]:
             restore_notes.append(f"📅 Aajna {len(state['trades'])} trades restore thaya "
@@ -780,6 +825,8 @@ def pick_hedge(opt_type, atm, atm_prem, expiry):
 
 
 async def open_position(direction: int, app: Application):
+    if state["day_halt"]:
+        return                              # divas limit hit -> navi entry nahi
     opt_type = "PE" if direction == 1 else "CE"
     spot = await asyncio.to_thread(nifty_spot)
     atm = round(spot / STRIKE_STEP) * STRIKE_STEP
@@ -876,6 +923,9 @@ async def _close_position(app: Application, reason: str):
         extra = "\n⏸ Same trend ma navi trade nahi, trend flip ni rah."
     await notify(app, f"🔴 EXIT [{mode.upper()}]\n{trade_block(trade)}\n"
                       f"Day PnL: {money(state['realized_pnl'])}{extra}")
+    lim = day_limit_reason(state["realized_pnl"])
+    if lim:
+        await set_day_halt(app, lim)
 
 
 def live_text(pnl, s_ltp, h_ltp) -> str:
@@ -923,6 +973,26 @@ async def notify(app: Application, text: str, html_mode: bool = False):
 
 
 # ----------------------------- MAIN LOOP ------------------------------
+def day_limit_reason(total_pnl: float):
+    """Divas nu limit hit thayu hoy to reason aape, nahi to None."""
+    if not DAY_LIMIT_ON or state["limit_override"]:
+        return None
+    if total_pnl <= -DAY_LOSS_LIMIT:
+        return f"DAY LOSS LIMIT (₹{total_pnl:,.0f} / -₹{DAY_LOSS_LIMIT:,.0f})"
+    if total_pnl >= DAY_PROFIT_LIMIT:
+        return f"DAY PROFIT TARGET (₹{total_pnl:,.0f} / ₹{DAY_PROFIT_LIMIT:,.0f})"
+    return None
+
+
+async def set_day_halt(app: Application, reason: str):
+    if state["day_halt"]:
+        return
+    state["day_halt"] = reason
+    save_state()
+    await notify(app, f"🛑 {reason}\nAaj nu navu trading band (open position band thayi gayi che).\n"
+                      f"Chalu rakhvu hoy to: Settings, Daily limit, ▶️ Resume today (athva /daylimit resume).")
+
+
 def roll_day():
     """Navo divas hoy to trades ane realized PnL reset."""
     today = datetime.now().date()
@@ -931,10 +1001,14 @@ def roll_day():
         state["trades"] = []
         state["realized_pnl"] = 0.0
         state["blocked_dir"] = None          # navo divas -> trend block reset
+        state["day_halt"] = None             # navo divas -> limit halt reset
+        state["limit_override"] = False
 
 
 async def tick(context: ContextTypes.DEFAULT_TYPE):
     roll_day()
+    if time.time() - _last_save[0] > 60:      # koi change save thatu rahi gayu hoy to pan 1 min ma save
+        save_state()
     # Angel JWT roughly 1 divas ma expire thay -> har 6 kalak ma fresh login (market time pehla pan)
     if time.time() - _last_login[0] > 6 * 3600:
         try:
@@ -955,6 +1029,10 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
             p = state["position"]
             if now.time() >= FORCE_EXIT:
                 return await close_position(app, "Time exit 15:15")
+            lim = day_limit_reason(state["realized_pnl"] + pnl)
+            if lim:
+                await close_position(app, lim)
+                return await set_day_halt(app, lim)
             if pnl <= p["sl"]:
                 return await close_position(app, f"STOP LOSS ({pnl:.0f})")
             if pnl >= p["tp"]:
@@ -1017,6 +1095,7 @@ async def cmd_run(update: Update, ctx):
         return
     state["running"] = True
     state["last_signal_candle"] = None
+    save_state()
     await update.message.reply_text(f"▶️ Bot running in {state['mode'].upper()} mode")
 
 
@@ -1024,6 +1103,7 @@ async def cmd_stop(update: Update, ctx):
     if not authorized(update):
         return
     state["running"] = False
+    save_state()
     await update.message.reply_text("⏸ Bot stopped (open position hoy to /exit vapro)")
 
 
@@ -1035,6 +1115,7 @@ async def cmd_mode(update: Update, ctx):
     if not ctx.args or ctx.args[0] not in ("paper", "live"):
         return await update.message.reply_text("Use: /mode paper  or  /mode live")
     state["mode"] = ctx.args[0]
+    save_state()
     await update.message.reply_text(f"Mode: {state['mode'].upper()}")
 
 
@@ -1124,6 +1205,7 @@ def main_menu_text() -> str:
             f"Strategy: 🧠 {strategy_label()} • ⏱{CANDLE_MINUTES}m\n"
             f"Position: {pos}\n"
             f"Day realized: ₹{state['realized_pnl']:,.0f}\n"
+            f"{('🛑 Daily limit hit: aaj trading band' + chr(10)) if state['day_halt'] else ''}"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"Option select karo 👇")
 
@@ -1265,6 +1347,17 @@ def expiry_kb() -> Markup:
     return Markup(rows)
 
 
+def day_limit_text() -> str:
+    if not DAY_LIMIT_ON:
+        return "🛑 Daily limit: OFF"
+    extra = ""
+    if state["day_halt"]:
+        extra = " • HIT, aaj band"
+    elif state["limit_override"]:
+        extra = " • aaj mate ignore"
+    return f"🛑 Daily limit: ON (loss -₹{DAY_LOSS_LIMIT:,.0f} / profit +₹{DAY_PROFIT_LIMIT:,.0f}){extra}"
+
+
 def settings_text() -> str:
     return (f"⚙️ Settings (navi trade thi lagu)\n"
             f"Lots: {LOTS} (qty {LOT_SIZE * LOTS})\n"
@@ -1273,11 +1366,22 @@ def settings_text() -> str:
             f"🎯 Target: {limit_text(TP_MODE, TP_VALUE)}\n"
             f"📅 Expiry: {expiry_label()}\n"
             f"Signal flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}\n"
+            f"{day_limit_text()}\n"
             f"🕒 Time: {ENTRY_START:%H:%M} - {LAST_ENTRY:%H:%M} (exit {FORCE_EXIT:%H:%M}) • "
             f"1 trade/trend: {'ON' if ONE_TRADE_PER_TREND else 'OFF'}")
 
 
 def settings_kb() -> Markup:
+    dl_rows = [[Btn(f"🛑 Daily limit: {'ON' if DAY_LIMIT_ON else 'OFF'} 🔄", callback_data="set_dlim_0")]]
+    if DAY_LIMIT_ON:
+        dl_rows += [
+            [Btn("➖", callback_data="set_dll_-1"), Btn(f"Loss -₹{DAY_LOSS_LIMIT:,.0f}", callback_data="noop"),
+             Btn("➕", callback_data="set_dll_1")],
+            [Btn("➖", callback_data="set_dlp_-1"), Btn(f"Profit +₹{DAY_PROFIT_LIMIT:,.0f}", callback_data="noop"),
+             Btn("➕", callback_data="set_dlp_1")],
+        ]
+        if state["day_halt"]:
+            dl_rows.append([Btn("▶️ Resume today (limit ignore)", callback_data="set_dres_0")])
     return Markup([
         [Btn("➖ Lots", callback_data="set_lots_-1"), Btn(f"{LOTS}", callback_data="noop"),
          Btn("➕ Lots", callback_data="set_lots_1")],
@@ -1291,11 +1395,13 @@ def settings_kb() -> Markup:
          Btn("➕", callback_data="set_tpv_1")],
         [Btn("📅 Expiry select", callback_data="expiry"), Btn("🕒 Time & Rules", callback_data="rules")],
         [Btn(f"🔁 Flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}", callback_data="set_flip_0")],
+        *dl_rows,
         [Btn("⬅️ Back", callback_data="menu")],
     ])
 
 
 async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
     q = update.callback_query
     if ALLOWED_CHAT_ID and q.message.chat_id != ALLOWED_CHAT_ID:
@@ -1528,6 +1634,19 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 TP_VALUE = max(i["lo"], min(i["hi"], TP_VALUE + v * i["step"]))
             elif key == "flip":
                 EXIT_ON_FLIP = not EXIT_ON_FLIP
+            elif key == "dlim":
+                DAY_LIMIT_ON = not DAY_LIMIT_ON
+                if not DAY_LIMIT_ON:
+                    state["day_halt"] = None
+                state["limit_override"] = False
+            elif key == "dll":
+                DAY_LOSS_LIMIT = max(DAY_LIMIT_STEP, min(200000.0, DAY_LOSS_LIMIT + v * DAY_LIMIT_STEP))
+            elif key == "dlp":
+                DAY_PROFIT_LIMIT = max(DAY_LIMIT_STEP, min(200000.0, DAY_PROFIT_LIMIT + v * DAY_LIMIT_STEP))
+            elif key == "dres":
+                state["day_halt"] = None
+                state["limit_override"] = True
+                state["last_signal_candle"] = None
             await q.answer("Updated")
             return await show(settings_text(), settings_kb())
         await q.answer()
@@ -1606,6 +1725,41 @@ async def _cmd_limit(update: Update, ctx, which: str):
     await update.message.reply_text(f"✅ {name} set: {limit_text(mode, value)}\nNavi trade thi lagu thase.")
 
 
+async def cmd_daylimit(update: Update, ctx):
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT
+    if not authorized(update):
+        return
+    usage = (f"{day_limit_text()}\n\n/daylimit on | off\n/daylimit loss 2000\n/daylimit profit 3000\n"
+             f"/daylimit resume  (limit hit thayu hoy to aaj mate chalu rakho)")
+    a = [x.lower() for x in ctx.args]
+    if not a:
+        return await update.message.reply_text(usage)
+    if a[0] in ("on", "off"):
+        DAY_LIMIT_ON = a[0] == "on"
+        if not DAY_LIMIT_ON:
+            state["day_halt"] = None
+        state["limit_override"] = False
+    elif a[0] == "resume":
+        state["day_halt"] = None
+        state["limit_override"] = True
+        state["last_signal_candle"] = None
+    elif a[0] in ("loss", "profit") and len(a) == 2:
+        try:
+            v = float(a[1].replace(",", "").replace("₹", ""))
+        except ValueError:
+            return await update.message.reply_text("❌ Amount samajyo nahi.\n\n" + usage)
+        if not 100 <= v <= 500000:
+            return await update.message.reply_text("❌ Amount 100 thi 5,00,000 vache joiye.")
+        if a[0] == "loss":
+            DAY_LOSS_LIMIT = v
+        else:
+            DAY_PROFIT_LIMIT = v
+    else:
+        return await update.message.reply_text("❌ Samajyu nahi.\n\n" + usage)
+    save_state()
+    await update.message.reply_text("✅ " + day_limit_text())
+
+
 async def cmd_sl(update: Update, ctx):
     await _cmd_limit(update, ctx, "sl")
 
@@ -1653,6 +1807,7 @@ async def post_init(app: Application):
         BotCommand("trades", "🧾 Today trades (lot, rate, PnL)"),
         BotCommand("export", "📥 History CSV file"),
         BotCommand("expiry", "📅 Expiry select (weekly/monthly)"),
+        BotCommand("daylimit", "🛑 Daily profit/loss limit"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -1885,6 +2040,10 @@ async def fast_exit_check(app: Application):
         pnl = r[0]
     if datetime.now().time() >= FORCE_EXIT:
         return await close_position(app, "Time exit 15:15")
+    lim = day_limit_reason(state["realized_pnl"] + pnl)
+    if lim:
+        await close_position(app, lim)
+        return await set_day_halt(app, lim)
     if pnl <= p["sl"]:
         return await close_position(app, f"STOP LOSS ({pnl:.0f})")
     if pnl >= p["tp"]:
@@ -2543,7 +2702,7 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("image", cmd_image), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("image", cmd_image), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_button))
