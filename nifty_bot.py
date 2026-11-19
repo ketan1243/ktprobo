@@ -548,6 +548,182 @@ def fills_text(orders, ltp_ref=None, exit_=False) -> str:
     return "\n".join(L)
 
 
+# ----------------------------- ANGEL -> BOT TRADE SYNC ---------------
+ORDER_RE = re.compile(r"^NIFTY(\d{2}[A-Z]{3}\d{2})(\d+)(CE|PE)$")
+_OID_COLS = ("sell_entry_oid", "hedge_entry_oid", "sell_exit_oid", "hedge_exit_oid")
+
+
+def _fl(x) -> float:
+    try:
+        return float(x or 0)
+    except Exception:
+        return 0.0
+
+
+def _parse_ts(o):
+    for k in ("updatetime", "exchtime", "ordertime"):
+        v = str(o.get(k) or "").strip()
+        for fmt in ("%d-%b-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(v, fmt)
+            except Exception:
+                pass
+    return None
+
+
+def _wavg(rows) -> float:
+    q = sum(x[0] for x in rows)
+    return sum(x[0] * x[1] for x in rows) / q if q else 0.0
+
+
+def angel_trade_groups(rows):
+    """Angel orderBook na executed NIFTY option orders ne 'flat thi flat' round-trip (trade) ma vahenche."""
+    execd = []
+    for o in rows or []:
+        sym = str(o.get("tradingsymbol") or "")
+        filled, avg = _fl(o.get("filledshares")), _fl(o.get("averageprice"))
+        if not ORDER_RE.match(sym) or filled <= 0 or avg <= 0:
+            continue
+        execd.append({"oid": str(o.get("orderid")), "sym": sym, "tok": str(o.get("symboltoken") or ""),
+                      "side": str(o.get("transactiontype") or "").upper(), "qty": filled, "px": avg, "ts": _parse_ts(o)})
+    execd.sort(key=lambda e: (e["ts"] or datetime.min, e["oid"]))
+    groups, cur, net = [], [], {}
+    for e in execd:
+        cur.append(e)
+        net[e["sym"]] = net.get(e["sym"], 0.0) + (e["qty"] if e["side"] == "BUY" else -e["qty"])
+        if all(abs(v) < 0.5 for v in net.values()):
+            groups.append(cur)
+            cur, net = [], {}
+    return groups, {k: v for k, v in net.items() if abs(v) >= 0.5}
+
+
+def group_to_record(g):
+    by = {}
+    for e in g:
+        by.setdefault(e["sym"], []).append(e)
+    if len(by) != 2:
+        return None
+    legs = {}
+    for sym, es in by.items():
+        first = es[0]["side"]
+        role = "sell" if first == "SELL" else "hedge"
+        ex_side = "BUY" if first == "SELL" else "SELL"
+        en = [(x["qty"], x["px"]) for x in es if x["side"] == first]
+        ex = [(x["qty"], x["px"]) for x in es if x["side"] == ex_side]
+        legs[role] = {"sym": sym, "entry": _wavg(en), "exit": _wavg(ex), "qty": sum(q for q, _ in en),
+                      "oid_in": es[0]["oid"], "oid_out": es[-1]["oid"]}
+    if set(legs) != {"sell", "hedge"}:
+        return None
+    S, H = legs["sell"], legs["hedge"]
+    qty = S["qty"]
+    sell_pts, hedge_pts = S["entry"] - S["exit"], H["exit"] - H["entry"]
+    t0, t1 = g[0]["ts"], g[-1]["ts"]
+    m = ORDER_RE.match(S["sym"])
+    try:
+        exp = str(datetime.strptime(m.group(1), "%d%b%y").date())
+    except Exception:
+        exp = ""
+    return {
+        "date": str((t0 or datetime.now()).date()),
+        "entry_time": t0.strftime("%H:%M:%S") if t0 else "", "exit_time": t1.strftime("%H:%M:%S") if t1 else "",
+        "time": t1.strftime("%H:%M:%S") if t1 else "",
+        "duration_min": round((t1 - t0).total_seconds() / 60, 1) if t0 and t1 else "",
+        "mode": "live", "strategy": "", "timeframe": "", "type": m.group(3), "expiry": exp,
+        "lots": max(1, round(qty / LOT_SIZE)), "qty": qty, "entry_spot": "", "exit_spot": "",
+        "sell_symbol": S["sym"], "sell_entry": round(S["entry"], 2), "sell_exit": round(S["exit"], 2),
+        "sell_pnl": round(sell_pts * qty, 2),
+        "hedge_symbol": H["sym"], "hedge_entry": round(H["entry"], 2), "hedge_exit": round(H["exit"], 2),
+        "hedge_pnl": round(hedge_pts * qty, 2),
+        "net_credit_pts": round(S["entry"] - H["entry"], 2), "net_exit_pts": round(S["exit"] - H["exit"], 2),
+        "net_points": round(sell_pts + hedge_pts, 2), "pnl": round((sell_pts + hedge_pts) * qty, 2),
+        "sl_rule": "", "tp_rule": "", "reason": "Angel thi sync", "price_src": "angel",
+        "sell_entry_oid": S["oid_in"], "hedge_entry_oid": H["oid_in"],
+        "sell_exit_oid": S["oid_out"], "hedge_exit_oid": H["oid_out"],
+        "charges": "", "net_pnl": "",
+    }
+
+
+def _known_trades():
+    """Bot ma pehla thi record thayela trades: order IDs + (date, symbol, entry time)."""
+    ids, sigs = set(), []
+    for r in list(state["trades"]) + read_history():
+        for k in _OID_COLS:
+            if r.get(k):
+                ids.add(str(r[k]))
+        try:
+            et = datetime.strptime(str(r.get("entry_time") or ""), "%H:%M:%S")
+        except Exception:
+            et = None
+        sigs.append((str(r.get("date")), str(r.get("sell_symbol")), et))
+    return ids, sigs
+
+
+def _is_known(rec, g_ids, known) -> bool:
+    ids, sigs = known
+    if g_ids & ids:
+        return True
+    try:
+        t0 = datetime.strptime(rec["entry_time"], "%H:%M:%S")
+    except Exception:
+        t0 = None
+    for d_, sym, et in sigs:
+        if d_ == rec["date"] and sym == rec["sell_symbol"] and (
+                et is None or t0 is None or abs((et - t0).total_seconds()) <= 180):
+            return True
+    return False
+
+
+def sync_angel_trades() -> dict:
+    """Angel orderBook thi aaj na trades shodhe je bot ma record nathi (blocking; thread ma chalavo)."""
+    ob = throttled(smart.orderBook)
+    if not isinstance(ob, dict) or not ob.get("status"):
+        return {"error": f"Orderbook nathi malyu: {ob}"}
+    groups, open_legs = angel_trade_groups(ob.get("data") or [])
+    known = _known_trades()
+    added, skipped = [], 0
+    for g in groups:
+        rec = group_to_record(g)
+        if not rec:
+            continue
+        if _is_known(rec, {e["oid"] for e in g}, known):
+            skipped += 1
+            continue
+        try:
+            ch = fetch_charges([{"side": e["side"], "symbol": e["sym"], "token": e["tok"], "qty": e["qty"],
+                                 "price": e["px"]} for e in g])
+            if ch[0] is not None:
+                rec["charges"], rec["net_pnl"] = round(ch[0], 2), round(rec["pnl"] - ch[0], 2)
+        except Exception:
+            pass
+        added.append(rec)
+    return {"added": added, "skipped": skipped, "groups": len(groups), "open": open_legs}
+
+
+async def apply_angel_sync() -> str:
+    res = await asyncio.to_thread(sync_angel_trades)
+    if res.get("error"):
+        return "❌ " + res["error"]
+    today = str(datetime.now().date())
+    for rec in res["added"]:
+        if rec["date"] == today:
+            state["trades"].append(rec)
+            state["realized_pnl"] += rec["pnl"]
+        append_history(rec)
+    if res["added"]:
+        save_state()
+    L = [f"📥 Angel sync: {res['groups']} trade Angel ma • {len(res['added'])} navu bot ma umeryu • "
+         f"{res['skipped']} pehla thi hatu"]
+    for rec in res["added"]:
+        L.append(f"➕ {rec['entry_time']} {rec['type']} {_strike_txt(rec['sell_symbol'])}/{_strike_txt(rec['hedge_symbol'])} "
+                 f"→ {money(rec['pnl'])}" + (f" (charges ₹{rec['charges']:,.2f})" if rec["charges"] != "" else ""))
+    if res["open"] and not state["position"]:
+        L.append("⚠️ Angel ma open position che je bot ne khabar nathi (bot ma position nathi):")
+        for sym, q in res["open"].items():
+            L.append(f"   {sym}: {'+' if q > 0 else ''}{q:g}")
+        L.append("Angel app ma check karo / band karo.")
+    return "\n".join(L)
+
+
 _chg_cache = {"sig": None, "t": 0.0, "val": None}
 
 
@@ -662,6 +838,12 @@ def _orders_pages(max_len=3400) -> list:
     gross = sell_v - buy_v
     note = "  (open position/adhuri qty, final nathi)" if (state.get("position") or abs(buy_q - sell_q) > 0.5) else ""
     S.append(f"Gross: {money(gross)}{note}")
+    try:
+        n_ang = len(angel_trade_groups(rows)[0])
+        S.append(f"🔁 Angel round-trips: {n_ang} | Bot ma record: {len(state['trades'])}"
+                 + ("  → bot ma umervā /sync" if n_ang != len(state["trades"]) else ""))
+    except Exception:
+        pass
     sig = tuple((e["oid"], e["qty"], e["price"]) for e in execd)
     if _chg_cache["sig"] == sig and time.time() - _chg_cache["t"] < 60:
         res = _chg_cache["val"]
@@ -716,6 +898,7 @@ restore_notes = []
 
 def save_state():
     try:
+        PROFILES[state["mode"]] = snapshot_settings()
         data = {
             "day": str(state["day"]) if state["day"] else str(datetime.now().date()),
             "mode": state["mode"],
@@ -730,15 +913,8 @@ def save_state():
             "trades": state["trades"],
             "position": state["position"],
             "last_event": state["last_event"],
-            "settings": {"LOTS": LOTS, "HEDGE_PCT": HEDGE_PCT, "SELL_OFFSET": SELL_OFFSET, "SL_MODE": SL_MODE, "SL_VALUE": SL_VALUE,
-                         "TP_MODE": TP_MODE, "TP_VALUE": TP_VALUE, "EXIT_ON_FLIP": EXIT_ON_FLIP,
-                         "ENTRY_START": ENTRY_START.strftime("%H:%M"), "LAST_ENTRY": LAST_ENTRY.strftime("%H:%M"),
-                         "FORCE_EXIT": FORCE_EXIT.strftime("%H:%M"),
-                         "ONE_TRADE_PER_TREND": ONE_TRADE_PER_TREND, "HISTORY_DAYS": HISTORY_DAYS,
-                         "EXPIRY_MODE": EXPIRY_MODE, "EXPIRY_SKIP_TODAY": EXPIRY_SKIP_TODAY,
-                         "CANDLE_MINUTES": CANDLE_MINUTES,
-                         "DAY_LIMIT_ON": DAY_LIMIT_ON, "DAY_LOSS_LIMIT": DAY_LOSS_LIMIT,
-                         "DAY_PROFIT_LIMIT": DAY_PROFIT_LIMIT},
+            "settings": PROFILES[state["mode"]],
+            "profiles": PROFILES,
         }
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -783,20 +959,27 @@ def read_history():
         return [_normalize_row(r) for r in csv.DictReader(f)]
 
 
-def load_state():
+PROFILES = {"paper": {}, "live": {}}       # paper ane live mate alag alag setting
+
+
+def snapshot_settings() -> dict:
+    """Atyaar ni (active mode ni) badhi setting."""
+    return {"LOTS": LOTS, "HEDGE_PCT": HEDGE_PCT, "SELL_OFFSET": SELL_OFFSET, "SL_MODE": SL_MODE, "SL_VALUE": SL_VALUE,
+            "TP_MODE": TP_MODE, "TP_VALUE": TP_VALUE, "EXIT_ON_FLIP": EXIT_ON_FLIP,
+            "ENTRY_START": ENTRY_START.strftime("%H:%M"), "LAST_ENTRY": LAST_ENTRY.strftime("%H:%M"),
+            "FORCE_EXIT": FORCE_EXIT.strftime("%H:%M"),
+            "ONE_TRADE_PER_TREND": ONE_TRADE_PER_TREND, "HISTORY_DAYS": HISTORY_DAYS,
+            "EXPIRY_MODE": EXPIRY_MODE, "EXPIRY_SKIP_TODAY": EXPIRY_SKIP_TODAY, "CANDLE_MINUTES": CANDLE_MINUTES,
+            "DAY_LIMIT_ON": DAY_LIMIT_ON, "DAY_LOSS_LIMIT": DAY_LOSS_LIMIT, "DAY_PROFIT_LIMIT": DAY_PROFIT_LIMIT,
+            "strategy": state["strategy"]}
+
+
+def apply_settings(st: dict):
+    """Setting dict ne globals ma lagu kare (mode badalta / file load thata)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
     global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
     global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception as e:
-        log.warning("state file vachay nahi: %s", e)
-        return
-    today = datetime.now().date()
-    st = d.get("settings", {})
+    st = st or {}
     LOTS = int(st.get("LOTS", LOTS))
     HEDGE_PCT = float(st.get("HEDGE_PCT", HEDGE_PCT))
     SELL_OFFSET = max(-5, min(5, int(st.get("SELL_OFFSET", SELL_OFFSET))))
@@ -825,6 +1008,56 @@ def load_state():
     tfm = int(st.get("CANDLE_MINUTES", CANDLE_MINUTES))
     if tfm in TIMEFRAMES:
         set_timeframe(tfm)
+    if st.get("strategy") in STRATEGIES:
+        state["strategy"] = st["strategy"]
+    _sig_cache["val"], _sig_cache["bucket"] = None, None
+
+
+def mode_trades() -> list:
+    """Aaj na trades fakt atyaar na mode na (paper / live alag)."""
+    return [t for t in state["trades"] if t.get("mode", state["mode"]) == state["mode"]]
+
+
+def mode_realized() -> float:
+    return sum(float(t.get("pnl") or 0) for t in mode_trades())
+
+
+def switch_mode(new: str):
+    """Mode badalo: juna mode ni setting save, navi mode ni setting load. Bot pause (surprise entry na thay)."""
+    old = state["mode"]
+    if new == old:
+        return
+    PROFILES[old] = snapshot_settings()
+    state["mode"] = new
+    apply_settings(PROFILES.get(new) or PROFILES[old])      # pehli vaar: juni setting nu copy
+    PROFILES[new] = snapshot_settings()
+    state["running"] = False
+    state["last_signal_candle"] = None
+    state["limit_override"] = False
+    state["day_halt"] = day_limit_reason(mode_realized())
+    save_state()
+
+
+def load_state():
+    global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
+    global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception as e:
+        log.warning("state file vachay nahi: %s", e)
+        return
+    today = datetime.now().date()
+    st0 = d.get("settings", {})
+    legacy = dict(st0, strategy=d.get("strategy"))
+    profs = d.get("profiles") or {}
+    PROFILES["paper"] = profs.get("paper") or dict(legacy)      # juna file ma banne mate same setting
+    PROFILES["live"] = profs.get("live") or dict(legacy)
+    state["mode"] = d.get("mode", "paper") if d.get("mode") in ("paper", "live") else "paper"
+    apply_settings(PROFILES[state["mode"]])
     state["mode"] = d.get("mode", "paper")
     state["dash_msg_id"] = d.get("dash_msg_id")
     state["dash_chat"] = d.get("dash_chat")
@@ -1373,7 +1606,7 @@ async def _close_position(app: Application, reason: str):
         extra = "\n⏸ Same trend ma navi trade nahi, trend flip ni rah."
     await notify(app, f"🔴 EXIT [{mode.upper()}]\n{trade_block(trade)}\n"
                       f"Day PnL: {money(state['realized_pnl'])}{extra}{live_txt}")
-    lim = day_limit_reason(state["realized_pnl"])
+    lim = day_limit_reason(mode_realized())
     if lim:
         await set_day_halt(app, lim)
 
@@ -1479,7 +1712,7 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
             p = state["position"]
             if now.time() >= FORCE_EXIT:
                 return await close_position(app, "Time exit 15:15")
-            lim = day_limit_reason(state["realized_pnl"] + pnl)
+            lim = day_limit_reason(mode_realized() + pnl)
             if lim:
                 await close_position(app, lim)
                 return await set_day_halt(app, lim)
@@ -1600,9 +1833,9 @@ async def cmd_mode(update: Update, ctx):
         return await update.message.reply_text("Position open che, pehla exit karo.")
     if not ctx.args or ctx.args[0] not in ("paper", "live"):
         return await update.message.reply_text("Use: /mode paper  or  /mode live")
-    state["mode"] = ctx.args[0]
-    save_state()
-    await update.message.reply_text(f"Mode: {state['mode'].upper()}")
+    switch_mode(ctx.args[0])
+    await update.message.reply_text(f"Mode: {state['mode'].upper()}\n{state['mode'].upper()} ni alag setting lagu thai. "
+                                    f"⏸ Bot pause thayo, ▶️ Run dabavo.\n\n" + settings_text())
 
 
 async def status_text() -> str:
@@ -1690,7 +1923,7 @@ def main_menu_text() -> str:
             f"Bot: {run}   Mode: {mode}\n"
             f"Strategy: 🧠 {strategy_label()} • ⏱{CANDLE_MINUTES}m\n"
             f"Position: {pos}\n"
-            f"Day realized: ₹{state['realized_pnl']:,.0f}\n"
+            f"Day realized: ₹{mode_realized():,.0f}\n"
             f"{('🛑 Daily limit hit: aaj trading band' + chr(10)) if state['day_halt'] else ''}"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"Option select karo 👇")
@@ -1846,7 +2079,7 @@ def day_limit_text() -> str:
 
 
 def settings_text() -> str:
-    return (f"⚙️ Settings (navi trade thi lagu)\n"
+    return (f"⚙️ Settings • {state['mode'].upper()} mode ni alag (navi trade thi lagu)\n"
             f"Lots: {LOTS} (qty {LOT_SIZE * LOTS})\n"
             f"Sell strike: {sell_label(SELL_OFFSET)}\n"
             f"Hedge premium: {HEDGE_PCT * 100:.0f}% of sold option\n"
@@ -1886,8 +2119,40 @@ def settings_kb() -> Markup:
         [Btn("📅 Expiry select", callback_data="expiry"), Btn("🕒 Time & Rules", callback_data="rules")],
         [Btn(f"🔁 Flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}", callback_data="set_flip_0")],
         *dl_rows,
+        [Btn(f"📋 {'LIVE' if state['mode'] == 'paper' else 'PAPER'} ni setting ahi copy karo", callback_data="set_copy_0")],
         [Btn("⬅️ Back", callback_data="menu")],
     ])
+
+
+async def _ans(q, *a, **k):
+    """Callback answer fail thay (query too old / network) to pan button no action na atke."""
+    try:
+        await q.answer(*a, **k)
+    except Exception as e:
+        log.debug("callback answer fail: %s", e)
+
+
+class _ShimMsg:
+    def __init__(self, m):
+        self._m = m
+
+    async def reply_text(self, *a, **k):
+        return await self._m.reply_text(*a, **k)
+
+    async def reply_document(self, *a, **k):
+        return await self._m.reply_document(*a, **k)
+
+    def __getattr__(self, n):
+        return getattr(self._m, n)
+
+
+class _ShimUpdate:
+    """Button dabavo = command chalavo: command function ne j call kare (je barobar chale che)."""
+    def __init__(self, q, upd):
+        self.message = _ShimMsg(q.message)
+        self.effective_chat = upd.effective_chat
+        self.effective_user = upd.effective_user
+        self.callback_query = q
 
 
 async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1895,7 +2160,7 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
     q = update.callback_query
     if ALLOWED_CHAT_ID and q.message.chat_id != ALLOWED_CHAT_ID:
-        return await q.answer("Not allowed", show_alert=True)
+        return await _ans(q, "Not allowed", show_alert=True)
     d = q.data
     app = ctx.application
 
@@ -1903,15 +2168,25 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await q.edit_message_text(text, reply_markup=kb)
         except Exception as e:
-            if "not modified" not in str(e).lower():
-                log.warning("menu edit failed: %s", e)
+            if "not modified" in str(e).lower():
+                return
+            log.warning("menu edit failed (%s) -> navo message moklu chhu", e)
+            try:
+                await q.message.reply_text(text, reply_markup=kb)
+            except Exception as e2:
+                log.warning("fallback message pan na gayo: %s", e2)
 
     async def show_html(text, kb):
         try:
             await q.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
-            if "not modified" not in str(e).lower():
-                log.warning("menu edit failed: %s", e)
+            if "not modified" in str(e).lower():
+                return
+            log.warning("menu edit failed (%s) -> navo message moklu chhu", e)
+            try:
+                await q.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+            except Exception as e2:
+                log.warning("fallback message pan na gayo: %s", e2)
 
     def _test_kb(extra=None):
         rows = [[Btn("🔍 Connection check (surakshit)", callback_data="test_check")],
@@ -1925,104 +2200,119 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "📨 Test order: 1 lot BUY LIMIT ₹0.05 sacho order moklse ane turant cancel karse.")
 
     try:
+        DIRECT = {"run": (cmd_run, "▶️ Bot chalu"), "stop": (cmd_stop, "⏸ Bot band"), "status": (cmd_status, "📊 Status..."),
+                  "pnl": (cmd_pnl, "💰 PnL..."), "signal": (cmd_signal, "📡 Signal..."),
+                  "summary": (cmd_summary, "📅 Summary..."), "trades": (cmd_trades, "📜 Trades..."),
+                  "help": (cmd_help, "❓ Help"), "live": (cmd_live, "💹 Live PnL...")}
+        if d in DIRECT:
+            fn_, toast = DIRECT[d]
+            await _ans(q, toast)
+            await fn_(_ShimUpdate(q, update), ctx)           # command j chale che (jem /run, /status)
+            if d in ("run", "stop"):
+                await show(main_menu_text(), main_menu_kb())
+            return
         if d == "angelorders":
-            await q.answer("Angel thi orders lai rahyo...")
+            await _ans(q, "Angel thi orders lai rahyo...")
             pages = await asyncio.to_thread(_orders_pages)
-            kb_ = Markup([[Btn("🔄 Refresh", callback_data="angelorders")], [Btn("⬅️ Back", callback_data="menu")]])
+            kb_ = Markup([[Btn("🔄 Refresh", callback_data="angelorders"), Btn("📥 Trades sync", callback_data="angelsync")],
+                          [Btn("⬅️ Back", callback_data="menu")]])
             if len(pages) == 1:
                 return await show(pages[0], kb_)
             await show(pages[0], None)
             for i_, pg in enumerate(pages[1:], 1):
                 await q.message.reply_text(pg, reply_markup=kb_ if i_ == len(pages) - 1 else None)
             return
+        if d == "angelsync":
+            await _ans(q, "Sync chalu...")
+            return await q.message.reply_text(await apply_angel_sync())
         if d == "angeltest":
-            await q.answer()
+            await _ans(q, )
             return await show(TEST_HOME, _test_kb())
         if d == "test_check":
-            await q.answer("Check chalu...")
+            await _ans(q, "Check chalu...")
             await show("⏳ Check chalu...", _test_kb())
             txt = await asyncio.to_thread(_test_checks)
             return await show(txt, _test_kb())
         if d == "test_ask":
-            await q.answer()
+            await _ans(q, )
             return await show("⚠️ Aa SACHO order Angel One ma jase.\n"
                               "ATM CE, 1 lot, BUY LIMIT ₹0.05 (fill thavani sambhavna nathi), turant cancel thase.\n"
                               "Market band hoy to reject thase, pan connection/IP no error dekhase.\n\nChalu karvu che?",
                               Markup([[Btn("✅ Haa, test order moklo", callback_data="test_go")],
                                       [Btn("❌ Na", callback_data="angeltest")]]))
         if d == "test_go":
-            await q.answer("Test order chalu...")
+            await _ans(q, "Test order chalu...")
             await show("⏳ Test order chalu...", _test_kb())
             txt = await asyncio.to_thread(_test_order_roundtrip)
             return await show(txt, _test_kb())
         if d == "noop":
-            return await q.answer()
+            return await _ans(q, )
         if d == "close":
-            await q.answer()
+            await _ans(q, )
             return await q.message.delete()
         if d == "menu":
-            await q.answer()
+            await _ans(q, "🔄 Refreshed")
             return await show(main_menu_text(), main_menu_kb())
         if d == "run":
             state["running"] = True
             state["last_signal_candle"] = None
-            await q.answer("Bot chalu thayo ▶️")
+            await _ans(q, "Bot chalu thayo ▶️")
             return await show(main_menu_text(), main_menu_kb())
         if d == "stop":
             state["running"] = False
-            await q.answer("Bot band ⏸")
+            await _ans(q, "Bot band ⏸")
             return await show(main_menu_text(), main_menu_kb())
         if d == "dashboard":
-            await q.answer("Dashboard khuli rahyu chhe...")
+            await _ans(q, "Dashboard khuli rahyu chhe...")
             return await start_dashboard(app, q.message.chat_id)
         if d == "dash_mode":
             state["dash_compact"] = not state["dash_compact"]
             state["dash_msg_id"], state["dash_chat"] = q.message.message_id, q.message.chat_id
             save_state()
-            await q.answer("Compact view" if state["dash_compact"] else "Full view")
+            await _ans(q, "Compact view" if state["dash_compact"] else "Full view")
             return await update_dashboard(app, force=True)
         if d == "dash_refresh":
-            await q.answer("Refreshed")
+            await _ans(q, "Refreshed")
             state["dash_msg_id"], state["dash_chat"] = q.message.message_id, q.message.chat_id
             save_state()
             return await update_dashboard(app, force=True)
         if d == "dash_stop":
             state["dash_msg_id"] = None
             save_state()
-            await q.answer("Auto-update band")
+            await _ans(q, "Auto-update band")
             return await show("⏹ Dashboard auto-update band.\n/dashboard thi pharithi chalu karo.",
                               Markup([[Btn("📺 Dashboard", callback_data="dashboard"),
                                        Btn("🏠 Menu", callback_data="menu_new")]]))
         if d == "menu_new":
-            await q.answer()
+            await _ans(q, )
             return await q.message.reply_text(main_menu_text(), reply_markup=main_menu_kb())
         if d == "history":
-            await q.answer()
+            await _ans(q, )
             return await q.message.reply_text(history_menu_text(), reply_markup=history_kb())
         if d == "hmenu":
-            await q.answer()
+            await _ans(q, )
             return await show(history_menu_text(), history_kb())
         if d.startswith("h_"):
             parts = d.split("_")
             if parts[1] == "sum":
-                await q.answer()
+                await _ans(q, )
                 return await show(
                     stats_text(load_trades(parts[2]), scope_label(parts[2]), daywise=parts[2] != "today"),
                     Markup([[Btn("🧾 Trade details", callback_data=f"h_tr_{parts[2]}_0"),
                              Btn("🗂 History", callback_data="hmenu")]]))
             if parts[1] == "tr":
-                await q.answer()
+                await _ans(q, )
                 text, kb = trade_page(parts[2], int(parts[3]))
                 return await show(text, kb)
             if parts[1] == "csv":
                 data = history_csv_bytes()
                 if not data:
-                    return await q.answer("History khali che", show_alert=True)
-                await q.answer("File moklu chhu...")
+                    return await _ans(q, "History khali che", show_alert=True)
+                await _ans(q, "File moklu chhu...")
                 return await q.message.reply_document(document=data, filename="trades_history.csv",
                                                       caption="📥 Full trade history (Excel ma khuli shake)")
         if d == "expiry":
-            await q.answer()
+            await _ans(q, )
             return await show(expiry_text(), expiry_kb())
         if d.startswith("exp_"):
             key = d[4:]
@@ -2030,10 +2320,10 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 EXPIRY_SKIP_TODAY = not EXPIRY_SKIP_TODAY
             elif key in EXPIRY_MODES:
                 EXPIRY_MODE = key
-            await q.answer(f"Expiry: {expiry_label()}")
+            await _ans(q, f"Expiry: {expiry_label()}")
             return await show(expiry_text(), expiry_kb())
         if d == "rules":
-            await q.answer()
+            await _ans(q, )
             return await show(rules_text(), rules_kb())
         if d.startswith("rule_"):
             _, key, val = d.split("_", 2)
@@ -2043,67 +2333,67 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 cur = {"start": ENTRY_START, "last": LAST_ENTRY, "end": FORCE_EXIT}[which]
                 err = set_time_value(which, _shift_time(cur, v * 5))
                 if err:
-                    return await q.answer(err, show_alert=True)
+                    return await _ans(q, err, show_alert=True)
             elif key == "otpt":
                 ONE_TRADE_PER_TREND = not ONE_TRADE_PER_TREND
                 if not ONE_TRADE_PER_TREND:
                     state["blocked_dir"] = None
             elif key == "hist":
                 if state["position"]:
-                    return await q.answer("Position open che, pehla exit karo", show_alert=True)
+                    return await _ans(q, "Position open che, pehla exit karo", show_alert=True)
                 HISTORY_DAYS = step_history(v)
                 _sig_cache["val"], _sig_cache["bucket"] = None, None
                 state["last_signal_candle"] = None
                 state["running"] = False            # signal badlay to surprise entry na thay
-            await q.answer("Updated")
+            await _ans(q, "Updated")
             return await show(rules_text(), rules_kb())
         if d == "strategy":
-            await q.answer()
+            await _ans(q, )
             return await show(strategy_text(), strategy_kb())
         if d.startswith("tf_"):
             if state["position"]:
-                return await q.answer("Position open che, pehla exit karo", show_alert=True)
+                return await _ans(q, "Position open che, pehla exit karo", show_alert=True)
             m = int(d[3:])
             if m in TIMEFRAMES:
                 set_timeframe(m)
                 state["last_signal_candle"] = None
                 state["running"] = False        # surprise entry na thay etle pause
-            await q.answer(f"Timeframe: {CANDLE_MINUTES} min • Bot paused")
+            await _ans(q, f"Timeframe: {CANDLE_MINUTES} min • Bot paused")
             return await show(strategy_text(), strategy_kb())
         if d.startswith("strat_"):
             if state["position"]:
-                return await q.answer("Position open che, pehla exit karo", show_alert=True)
+                return await _ans(q, "Position open che, pehla exit karo", show_alert=True)
             key = d[6:]
             if key in STRATEGIES:
                 state["strategy"] = key
                 _sig_cache["val"], _sig_cache["bucket"] = None, None
                 state["last_signal_candle"] = None
                 state["running"] = False        # surprise entry na thay etle pause
-            await q.answer(f"Strategy: {strategy_label()} • Bot paused")
+            await _ans(q, f"Strategy: {strategy_label()} • Bot paused")
             return await show(strategy_text(), strategy_kb())
         if d == "signal":
-            await q.answer("Signal check thai rahyo chhe...")
+            await _ans(q, "Signal check thai rahyo chhe...")
             return await q.message.reply_text(await signal_text())
         if d == "summary":
-            await q.answer()
+            await _ans(q, )
             return await q.message.reply_text(await summary_text())
         if d == "status":
-            await q.answer("Status mangavi rahyo chhu...")
+            await _ans(q, "Status mangavi rahyo chhu...")
             return await q.message.reply_text(await status_text())
         if d == "pnl":
-            await q.answer()
+            await _ans(q, )
             return await q.message.reply_text(await pnl_text())
         if d == "trades":
-            await q.answer()
+            await _ans(q, )
             text, kb = trade_page("today", 0)
             return await q.message.reply_text(text, reply_markup=kb)
         if d == "help":
-            await q.answer()
+            await _ans(q, )
             return await q.message.reply_text(HELP_TEXT)
         if d == "live":
             if not state["position"]:
-                return await q.answer("Koi open position nathi", show_alert=True)
-            await q.answer()
+                return await _ans(q, "Koi open position nathi", show_alert=True)
+            await _ans(q, )
             pnl, s_, h_ = await position_pnl()
             state["live_msg_id"] = None
             return await update_live(app, pnl, s_, h_, force=True)
@@ -2111,39 +2401,48 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ---- mode
         if d in ("mode_paper", "mode_live", "mode_live_yes"):
             if state["position"]:
-                return await q.answer("Position open che, pehla exit karo", show_alert=True)
+                return await _ans(q, "Position open che, pehla exit karo", show_alert=True)
             if d == "mode_live":
-                await q.answer()
+                await _ans(q, )
                 return await show("⚠️ LIVE mode ma Angel One ma REAL orders jashe.\nPakka live karvu che?",
                                   Markup([[Btn("✅ Yes, LIVE", callback_data="mode_live_yes"),
                                            Btn("↩️ Cancel", callback_data="menu")]]))
-            state["mode"] = "live" if d == "mode_live_yes" else "paper"
-            await q.answer(f"Mode: {state['mode'].upper()}")
+            switch_mode("live" if d == "mode_live_yes" else "paper")
+            await _ans(q, f"Mode: {state['mode'].upper()} • alag setting • Bot pause")
             return await show(main_menu_text(), main_menu_kb())
 
         # ---- exit position (confirm)
         if d == "exit":
             if not state["position"]:
-                return await q.answer("Koi open position nathi", show_alert=True)
-            await q.answer()
+                return await _ans(q, "Koi open position nathi", show_alert=True)
+            await _ans(q, )
             return await show("🚪 Position abhi exit karvi che?",
                               Markup([[Btn("✅ Yes, Exit", callback_data="exit_yes"),
                                        Btn("↩️ Cancel", callback_data="menu")]]))
         if d == "exit_yes":
-            await q.answer("Exit thai rahyu chhe...")
+            await _ans(q, "Exit thai rahyu chhe...")
             if state["position"]:
                 await close_position(app, "Manual exit (button)")
             return await show(main_menu_text(), main_menu_kb())
 
         # ---- settings
         if d == "settings":
-            await q.answer()
+            await _ans(q, )
             return await show(settings_text(), settings_kb())
         if d.startswith("set_"):
             _, key, val = d.split("_", 2)
             v = int(val)
             if key == "lots":
                 LOTS = max(1, min(50, LOTS + v))
+            elif key == "copy":
+                other = "live" if state["mode"] == "paper" else "paper"
+                if state["position"]:
+                    return await _ans(q, "Position open che, pehla exit karo", show_alert=True)
+                if not PROFILES.get(other):
+                    return await _ans(q, f"{other.upper()} ni setting haju save nathi", show_alert=True)
+                apply_settings(PROFILES[other])
+                state["running"] = False
+                state["last_signal_candle"] = None
             elif key == "soff":
                 SELL_OFFSET = max(-5, min(5, SELL_OFFSET + v))
             elif key == "hedge":
@@ -2175,12 +2474,12 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 state["day_halt"] = None
                 state["limit_override"] = True
                 state["last_signal_candle"] = None
-            await q.answer("Updated")
+            await _ans(q, "Updated")
             return await show(settings_text(), settings_kb())
-        await q.answer()
+        await _ans(q, )
     except Exception as e:
         log.exception("button error")
-        await q.answer(f"Error: {str(e)[:150]}", show_alert=True)
+        await _ans(q, f"Error: {str(e)[:150]}", show_alert=True)
 
 
 # ----------------------------- SIGNAL / SUMMARY -----------------------
@@ -2407,6 +2706,13 @@ def _test_order_roundtrip() -> str:
     return "\n".join(lines)
 
 
+async def cmd_sync(update: Update, ctx):
+    if not authorized(update):
+        return
+    await update.message.reply_text("⏳ Angel orders thi trades sync...")
+    await update.message.reply_text(await apply_angel_sync())
+
+
 async def cmd_orders(update: Update, ctx):
     if not authorized(update):
         return
@@ -2460,6 +2766,16 @@ async def cmd_time(update: Update, ctx):
                                     f"End {FORCE_EXIT:%H:%M}")
 
 
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Koi handler ma error aave to log kare ane button dabavnar ne jaan kare (silent fail nahi)."""
+    log.error("handler error: %s", ctx.error, exc_info=ctx.error)
+    try:
+        if isinstance(update, Update) and update.callback_query:
+            await _ans(update.callback_query, "⚠️ Error thayo, fari dabavo", show_alert=False)
+    except Exception:
+        pass
+
+
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await on_button_inner(update, ctx)
@@ -2483,6 +2799,7 @@ async def post_init(app: Application):
         BotCommand("strike", "🎯 Sell strike (ATM / OTM / ITM)"),
         BotCommand("storage", "💾 Saved data / storage"),
         BotCommand("keyboard", "⌨️ Neeche na buttons (/keyboard off = band)"),
+        BotCommand("sync", "📥 Angel orders thi trades bot ma umero"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -2507,6 +2824,13 @@ async def post_init(app: Application):
             await app.bot.send_message(ALLOWED_CHAT_ID, msg, reply_markup=bottom_kb())
         except Exception as e:
             log.warning("startup message fail: %s", e)
+        if state["mode"] == "live":
+            try:                                   # restart/deploy ma state gayu hoy to Angel thi trades pacha lavo
+                txt = await apply_angel_sync()
+                if "navu bot ma umeryu" in txt and " 0 navu" not in txt:
+                    await app.bot.send_message(ALLOWED_CHAT_ID, txt)
+            except Exception as e:
+                log.warning("startup sync fail: %s", e)
 
 
 # ----------------------------- DASHBOARD ------------------------------
@@ -2747,9 +3071,9 @@ async def dashboard_text() -> str:
     L.append("")
 
     # ---------------- TODAY ----------------
-    tr = state["trades"]
+    tr = mode_trades()
     wins = sum(1 for t in tr if t["pnl"] > 0)
-    total = state["realized_pnl"] + open_pnl
+    total = mode_realized() + open_pnl
     wr = wins / len(tr) if tr else 0
     best = max((t["pnl"] for t in tr), default=0)
     worst = min((t["pnl"] for t in tr), default=0)
@@ -2757,7 +3081,7 @@ async def dashboard_text() -> str:
     L.append(kv([
         ("Trades", f"{len(tr)}   ✅{wins} ❌{len(tr) - wins}"),
         ("Win", f"{bar(wr)} {wr * 100:.0f}%" if tr else "-"),
-        ("Realized", money(state["realized_pnl"])),
+        ("Realized", money(mode_realized())),
         ("Open", money(open_pnl)),
         ("Best", money(best)),
         ("Worst", money(worst)),
@@ -2801,9 +3125,9 @@ async def dashboard_compact_text() -> str:
             L.append(f"📌 open (PnL n/a: {esc(str(e)[:30])})")
     else:
         L.append("📌 No position")
-    tr = state["trades"]
+    tr = mode_trades()
     wins = sum(1 for t in tr if t["pnl"] > 0)
-    total = state["realized_pnl"] + open_pnl
+    total = mode_realized() + open_pnl
     L.append(f"📅 {'🟢' if total >= 0 else '🔴'} <b>{money(total)}</b> • {len(tr)} trades ✅{wins} ❌{len(tr) - wins}")
     if state["day_halt"]:
         L.append("🛑 Daily limit hit: aaj trading band")
@@ -2922,7 +3246,7 @@ async def fast_exit_check(app: Application):
         pnl = r[0]
     if datetime.now().time() >= FORCE_EXIT:
         return await close_position(app, "Time exit 15:15")
-    lim = day_limit_reason(state["realized_pnl"] + pnl)
+    lim = day_limit_reason(mode_realized() + pnl)
     if lim:
         await close_position(app, lim)
         return await set_day_halt(app, lim)
@@ -3246,12 +3570,17 @@ def main():
     load_scrips()
     start_ws()
     threading.Thread(target=_price_poller, daemon=True).start()   # WS na chale to pan prices fast rahe
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = (Application.builder().token(TELEGRAM_TOKEN).post_init(post_init)
+           .concurrent_updates(True)                 # ek slow handler bija buttons/commands ne na atkave
+           .connection_pool_size(32).pool_timeout(15).connect_timeout(15)
+           .read_timeout(25).write_timeout(25)
+           .build())
+    app.add_error_handler(on_error)
     for name, fn in [("start", cmd_start), ("run", cmd_run), ("stop", cmd_stop), ("mode", cmd_mode),
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_bottom_text))
@@ -3259,7 +3588,7 @@ def main():
     app.job_queue.run_repeating(tick, interval=LOOP_SECONDS, first=5)
     app.job_queue.run_repeating(fast_loop, interval=DASH_REFRESH, first=3)
     app.job_queue.run_repeating(dash_loop, interval=1, first=4)      # dashboard auto refresh (alag job)
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)        # restart par juna (late) button/command na chale
 
 
 if __name__ == "__main__":
