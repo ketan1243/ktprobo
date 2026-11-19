@@ -960,6 +960,7 @@ def read_history():
 
 
 PROFILES = {"paper": {}, "live": {}}       # paper ane live mate alag alag setting
+_cfg_lock = threading.RLock()              # settings swap thay tyare worker threads ne wrong value na dekhay
 
 
 def snapshot_settings() -> dict:
@@ -1011,6 +1012,209 @@ def apply_settings(st: dict):
     if st.get("strategy") in STRATEGIES:
         state["strategy"] = st["strategy"]
     _sig_cache["val"], _sig_cache["bucket"] = None, None
+
+
+def _with_profile(prof: str, fn):
+    """Fn ne 'prof' ni setting ma chalave (sync, koi await nahi). Active mode na hoy to globals thodi vaar swap karine pacha."""
+    active = state["mode"]
+    if prof == active:
+        _view["inactive"] = False
+        return fn()
+    if not _cfg_lock.acquire(timeout=4):
+        raise RuntimeError("Bot thodo busy che, 2 second pachhi fari dabavo")
+    try:
+        PROFILES[active] = snapshot_settings()
+        sc = dict(_sig_cache)
+        apply_settings(PROFILES[prof] or PROFILES[active])
+        _view["inactive"] = True
+        try:
+            return fn()
+        finally:
+            PROFILES[prof] = snapshot_settings()
+            apply_settings(PROFILES[active])
+            _sig_cache.update(sc)
+            _view["inactive"] = False
+    finally:
+        _cfg_lock.release()
+
+
+def copy_profile(prof: str):
+    """Bija mode ni setting 'prof' ma copy. Error text athva None."""
+    other = "live" if prof == "paper" else "paper"
+    active = state["mode"]
+    if prof == active and state["position"]:
+        return "Position open che, pehla exit karo"
+    src = snapshot_settings() if other == active else PROFILES.get(other)
+    if not src:
+        return f"{other.upper()} ni setting haju save nathi"
+    PROFILES[prof] = dict(src)
+    if prof == active:
+        apply_settings(PROFILES[prof])
+        state["running"] = False
+        state["last_signal_candle"] = None
+    return None
+
+
+def _do_action(d: str, inactive: bool):
+    """Setting button no sync action. Return (toast, alert)."""
+    global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND
+    global HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY, DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
+    if d.startswith("set_"):
+        _, key, val = d.split("_", 2)
+        v = int(val)
+        if key == "lots":
+            LOTS = max(1, min(50, LOTS + v))
+        elif key == "soff":
+            SELL_OFFSET = max(-5, min(5, SELL_OFFSET + v))
+        elif key == "hedge":
+            HEDGE_PCT = max(0.10, min(0.60, round(HEDGE_PCT + v / 100, 2)))
+        elif key == "slm":
+            SL_MODE = MODE_ORDER[(MODE_ORDER.index(SL_MODE) + 1) % len(MODE_ORDER)]
+            SL_VALUE = MODE_INFO[SL_MODE]["default"]
+        elif key == "tpm":
+            TP_MODE = MODE_ORDER[(MODE_ORDER.index(TP_MODE) + 1) % len(MODE_ORDER)]
+            TP_VALUE = MODE_INFO[TP_MODE]["default"]
+        elif key == "slv":
+            i = MODE_INFO[SL_MODE]
+            SL_VALUE = max(i["lo"], min(i["hi"], SL_VALUE + v * i["step"]))
+        elif key == "tpv":
+            i = MODE_INFO[TP_MODE]
+            TP_VALUE = max(i["lo"], min(i["hi"], TP_VALUE + v * i["step"]))
+        elif key == "flip":
+            EXIT_ON_FLIP = not EXIT_ON_FLIP
+        elif key == "dlim":
+            DAY_LIMIT_ON = not DAY_LIMIT_ON
+            if not inactive:
+                if not DAY_LIMIT_ON:
+                    state["day_halt"] = None
+                state["limit_override"] = False
+        elif key == "dll":
+            DAY_LOSS_LIMIT = max(DAY_LIMIT_STEP, min(200000.0, DAY_LOSS_LIMIT + v * DAY_LIMIT_STEP))
+        elif key == "dlp":
+            DAY_PROFIT_LIMIT = max(DAY_LIMIT_STEP, min(200000.0, DAY_PROFIT_LIMIT + v * DAY_LIMIT_STEP))
+        elif key == "dres":
+            if inactive:
+                return "Aa mode chalu nathi", True
+            state["day_halt"] = None
+            state["limit_override"] = True
+            state["last_signal_candle"] = None
+        return "Updated", False
+    if d.startswith("exp_"):
+        key = d[4:]
+        if key == "skip":
+            EXPIRY_SKIP_TODAY = not EXPIRY_SKIP_TODAY
+        elif key in EXPIRY_MODES:
+            EXPIRY_MODE = key
+        return f"Expiry: {expiry_label()}", False
+    if d.startswith("rule_"):
+        _, key, val = d.split("_", 2)
+        v = int(val)
+        if key in ("tstart", "tlast", "tend"):
+            which = {"tstart": "start", "tlast": "last", "tend": "end"}[key]
+            cur = {"start": ENTRY_START, "last": LAST_ENTRY, "end": FORCE_EXIT}[which]
+            err = set_time_value(which, _shift_time(cur, v * 5))
+            if err:
+                return err, True
+        elif key == "otpt":
+            ONE_TRADE_PER_TREND = not ONE_TRADE_PER_TREND
+            if not ONE_TRADE_PER_TREND and not inactive:
+                state["blocked_dir"] = None
+        elif key == "hist":
+            if state["position"] and not inactive:
+                return "Position open che, pehla exit karo", True
+            HISTORY_DAYS = step_history(v)
+            if not inactive:
+                _sig_cache["val"], _sig_cache["bucket"] = None, None
+                state["last_signal_candle"] = None
+                state["running"] = False
+        return "Updated", False
+    if d.startswith("tf_"):
+        if state["position"] and not inactive:
+            return "Position open che, pehla exit karo", True
+        m = int(d[3:])
+        if m in TIMEFRAMES:
+            set_timeframe(m)
+            if not inactive:
+                state["last_signal_candle"] = None
+                state["running"] = False
+        return f"Timeframe: {CANDLE_MINUTES} min" + ("" if inactive else " • Bot paused"), False
+    if d.startswith("strat_"):
+        if state["position"] and not inactive:
+            return "Position open che, pehla exit karo", True
+        key = d[6:]
+        if key in STRATEGIES:
+            state["strategy"] = key
+            if not inactive:
+                _sig_cache["val"], _sig_cache["bucket"] = None, None
+                state["last_signal_candle"] = None
+                state["running"] = False
+        return f"Strategy: {strategy_label()}" + ("" if inactive else " • Bot paused"), False
+    return "", False
+
+
+def _prefix_kb(kb, prof: str, back_cb: str):
+    """Badha callbacks ne 'cfg|<prof>|' lagavo, ⬅️ Back ne back_cb par fervo."""
+    rows = []
+    for row in kb.inline_keyboard:
+        new = []
+        for b in row:
+            cd = b.callback_data
+            if cd == "noop" or cd is None:
+                new.append(b)
+            elif cd == "menu" and b.text.startswith("⬅️"):
+                new.append(Btn(b.text, callback_data=back_cb))
+            elif cd == "menu":
+                new.append(b)                                   # 🏠 Menu
+            else:
+                new.append(Btn(b.text, callback_data=f"cfg|{prof}|{cd}"))
+        rows.append(new)
+    return Markup(rows)
+
+
+def cfg_handle(prof: str, d: str):
+    """Setting action + page, 'prof' mode ni setting par. Return (toast, alert, text, kb)."""
+    out = {"toast": "", "alert": False}
+    icon = "⚡ LIVE" if prof == "live" else "📝 PAPER"
+
+    def run():
+        inactive = _view["inactive"]
+        if d not in ("settings", "expiry", "rules", "strategy"):
+            out["toast"], out["alert"] = _do_action(d, inactive)
+        if d == "expiry" or d.startswith("exp_"):
+            t, k, back = expiry_text(), expiry_kb(), "settings"
+        elif d == "rules" or d.startswith("rule_"):
+            t, k, back = rules_text(), rules_kb(), "settings"
+        elif d == "strategy" or d.startswith(("tf_", "strat_")):
+            t, k, back = strategy_text(), strategy_kb(), f"cfg|{prof}|settings"
+            t = f"{icon} profile\n" + t
+        else:
+            return settings_text(prof), _prefix_kb(settings_kb(prof), prof, "settings")
+        if not t.startswith(icon):
+            t = f"{icon} profile\n" + t
+        return t, _prefix_kb(k, prof, back)
+
+    text, kb = _with_profile(prof, run)
+    return out["toast"], out["alert"], text, kb
+
+
+def settings_hub():
+    """Settings ni pehli screen: Paper ane Live alag button."""
+    def summ(prof):
+        def f():
+            return (f"Lots {LOTS} • {sell_label(SELL_OFFSET)} • Hedge {HEDGE_PCT * 100:.0f}% • "
+                    f"SL {limit_short(SL_MODE, SL_VALUE)} • TP {limit_short(TP_MODE, TP_VALUE)}\n"
+                    f"   {strategy_label()} {CANDLE_MINUTES}m • {ENTRY_START:%H:%M}-{LAST_ENTRY:%H:%M} • "
+                    f"Limit {'ON' if DAY_LIMIT_ON else 'OFF'}")
+        return _with_profile(prof, f)
+    act = state["mode"]
+    text = (f"⚙️ Settings\nChalu mode: {'⚡ LIVE' if act == 'live' else '📝 PAPER'}\n\n"
+            f"📝 PAPER{' ✅' if act == 'paper' else ''}\n   {summ('paper')}\n\n"
+            f"⚡ LIVE{' ✅' if act == 'live' else ''}\n   {summ('live')}\n\n"
+            "Kai mode ni setting badalvi che? 👇\n(Banne ni setting alag save thay che)")
+    kb = Markup([[Btn("📝 Paper settings", callback_data="cfg|paper|settings"),
+                  Btn("⚡ Live settings", callback_data="cfg|live|settings")],
+                 [Btn("🏠 Menu", callback_data="menu")]])
+    return text, kb
 
 
 def mode_trades() -> list:
@@ -1423,6 +1627,15 @@ def pick_hedge(opt_type, atm, atm_prem, expiry):
     return best
 
 
+def _locked(fn):
+    def w(*a, **k):
+        with _cfg_lock:
+            return fn(*a, **k)
+    w.__name__ = fn.__name__
+    w.__doc__ = fn.__doc__
+    return w
+
+
 def pick_legs_batch(opt_type, atm, expiry):
     """ATM + 49 hedge-candidate strikes na prices ek j API call ma. (sell_opt, sell_px, hedge_opt, hedge_px)"""
     sign = -1 if opt_type == "PE" else 1
@@ -1452,6 +1665,11 @@ def pick_legs_batch(opt_type, atm, expiry):
     hedge = min(pool, key=lambda c: abs(px[c["token"]] - target))
     strip = lambda o: {k: o[k] for k in ("symbol", "token", "strike", "type")}
     return strip(sell), sell_px, strip(hedge), px[hedge["token"]]
+
+
+pick_hedge = _locked(pick_hedge)
+pick_legs_batch = _locked(pick_legs_batch)
+current_signal = _locked(current_signal)
 
 
 async def open_position(direction: int, app: Application):
@@ -1773,7 +1991,8 @@ def bottom_kb():
 
 
 async def cmd_settings_btn(update: Update, ctx):
-    await update.message.reply_text(settings_text(), reply_markup=settings_kb())
+    text_, kb_ = settings_hub()
+    await update.message.reply_text(text_, reply_markup=kb_)
 
 
 async def on_bottom_text(update: Update, ctx):
@@ -2067,19 +2286,27 @@ def expiry_kb() -> Markup:
     return Markup(rows)
 
 
+_view = {"inactive": False}      # settings page je mode ni jove che te atyaar no active mode nathi
+
+
 def day_limit_text() -> str:
     if not DAY_LIMIT_ON:
         return "🛑 Daily limit: OFF"
     extra = ""
-    if state["day_halt"]:
+    if _view["inactive"]:
+        extra = ""
+    elif state["day_halt"]:
         extra = " • HIT, aaj band"
     elif state["limit_override"]:
         extra = " • aaj mate ignore"
     return f"🛑 Daily limit: ON (loss -₹{DAY_LOSS_LIMIT:,.0f} / profit +₹{DAY_PROFIT_LIMIT:,.0f}){extra}"
 
 
-def settings_text() -> str:
-    return (f"⚙️ Settings • {state['mode'].upper()} mode ni alag (navi trade thi lagu)\n"
+def settings_text(prof=None) -> str:
+    prof = prof or state["mode"]
+    tag = "✅ chalu mode" if prof == state["mode"] else "chalu nathi"
+    return (f"{'⚡ LIVE' if prof == 'live' else '📝 PAPER'} settings ({tag}) • navi trade thi lagu\n"
+            f"🧠 Strategy: {strategy_label()} • ⏱ {CANDLE_MINUTES}m\n"
             f"Lots: {LOTS} (qty {LOT_SIZE * LOTS})\n"
             f"Sell strike: {sell_label(SELL_OFFSET)}\n"
             f"Hedge premium: {HEDGE_PCT * 100:.0f}% of sold option\n"
@@ -2092,7 +2319,8 @@ def settings_text() -> str:
             f"1 trade/trend: {'ON' if ONE_TRADE_PER_TREND else 'OFF'}")
 
 
-def settings_kb() -> Markup:
+def settings_kb(prof=None) -> Markup:
+    prof = prof or state["mode"]
     dl_rows = [[Btn(f"🛑 Daily limit: {'ON' if DAY_LIMIT_ON else 'OFF'} 🔄", callback_data="set_dlim_0")]]
     if DAY_LIMIT_ON:
         dl_rows += [
@@ -2101,7 +2329,7 @@ def settings_kb() -> Markup:
             [Btn("➖", callback_data="set_dlp_-1"), Btn(f"Profit +₹{DAY_PROFIT_LIMIT:,.0f}", callback_data="noop"),
              Btn("➕", callback_data="set_dlp_1")],
         ]
-        if state["day_halt"]:
+        if state["day_halt"] and not _view["inactive"]:
             dl_rows.append([Btn("▶️ Resume today (limit ignore)", callback_data="set_dres_0")])
     return Markup([
         [Btn("➖ Lots", callback_data="set_lots_-1"), Btn(f"{LOTS}", callback_data="noop"),
@@ -2116,10 +2344,11 @@ def settings_kb() -> Markup:
         [Btn(f"🎯 Target type: {MODE_INFO[TP_MODE]['name']} 🔄", callback_data="set_tpm_0")],
         [Btn("➖", callback_data="set_tpv_-1"), Btn(limit_short(TP_MODE, TP_VALUE), callback_data="noop"),
          Btn("➕", callback_data="set_tpv_1")],
+        [Btn("🧠 Strategy & Timeframe", callback_data="strategy")],
         [Btn("📅 Expiry select", callback_data="expiry"), Btn("🕒 Time & Rules", callback_data="rules")],
         [Btn(f"🔁 Flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}", callback_data="set_flip_0")],
         *dl_rows,
-        [Btn(f"📋 {'LIVE' if state['mode'] == 'paper' else 'PAPER'} ni setting ahi copy karo", callback_data="set_copy_0")],
+        [Btn(f"📋 {'LIVE' if prof == 'paper' else 'PAPER'} ni setting ahi copy karo", callback_data="set_copy_0")],
         [Btn("⬅️ Back", callback_data="menu")],
     ])
 
@@ -2199,7 +2428,28 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "🔍 Connection check: login, funds ane order IP check. Koi order nathi jatu.\n"
                  "📨 Test order: 1 lot BUY LIMIT ₹0.05 sacho order moklse ane turant cancel karse.")
 
+    async def _handle_cfg(prof, inner):
+        if inner == "set_copy_0":
+            err = copy_profile(prof)
+            if err:
+                return await _ans(q, err, show_alert=True)
+            toast, alert, text, kb = cfg_handle(prof, "settings")
+            toast = "Copy thayu ✅" + (" • Bot pause" if prof == state["mode"] else "")
+        else:
+            toast, alert, text, kb = cfg_handle(prof, inner)
+        await _ans(q, toast or None, show_alert=alert) if toast else await _ans(q)
+        await show(text, kb)
+
     try:
+        if d == "settings":
+            await _ans(q)
+            text_, kb_ = settings_hub()
+            return await show(text_, kb_)
+        if d.startswith("cfg|"):
+            _, prof_, inner_ = d.split("|", 2)
+            return await _handle_cfg(prof_, inner_)
+        if d.startswith(("set_", "exp_", "rule_", "tf_", "strat_")) or d in ("expiry", "rules", "strategy"):
+            return await _handle_cfg(state["mode"], d)          # juna messages na buttons pan chale
         DIRECT = {"run": (cmd_run, "▶️ Bot chalu"), "stop": (cmd_stop, "⏸ Bot band"), "status": (cmd_status, "📊 Status..."),
                   "pnl": (cmd_pnl, "💰 PnL..."), "signal": (cmd_signal, "📡 Signal..."),
                   "summary": (cmd_summary, "📅 Summary..."), "trades": (cmd_trades, "📜 Trades..."),
