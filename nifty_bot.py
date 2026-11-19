@@ -17,6 +17,7 @@ Telegram commands:
 """
 import asyncio
 import csv
+import shutil
 import html
 import io
 import json
@@ -38,8 +39,9 @@ try:
 except Exception:   # lib ma na hoy to REST fallback
     SmartWebSocketV2 = None
 from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
-                      MenuButtonCommands, Update)
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+                      MenuButtonCommands, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
 from dotenv import load_dotenv
 
@@ -1525,10 +1527,46 @@ def authorized(update: Update) -> bool:
     return ALLOWED_CHAT_ID == 0 or update.effective_chat.id == ALLOWED_CHAT_ID
 
 
+# ----------------------------- BOTTOM BUTTONS (type karvu nahi pade) -----------------
+BOTTOM_ROWS = [["📺 Dashboard", "🏠 Menu"], ["▶️ Run", "⏸ Stop"], ["📒 Orders", "⚙️ Settings"]]
+
+
+def bottom_kb():
+    try:
+        return ReplyKeyboardMarkup(BOTTOM_ROWS, resize_keyboard=True, is_persistent=True,
+                                   input_field_placeholder="Neeche na buttons vapro 👇")
+    except TypeError:                                   # juni telegram library
+        return ReplyKeyboardMarkup(BOTTOM_ROWS, resize_keyboard=True)
+
+
+async def cmd_settings_btn(update: Update, ctx):
+    await update.message.reply_text(settings_text(), reply_markup=settings_kb())
+
+
+async def on_bottom_text(update: Update, ctx):
+    """Neeche na button no text -> te action. Bija koi text (chat) ne ignore kare."""
+    if not update.message or not authorized(update):
+        return
+    actions = {"📺 Dashboard": cmd_dashboard, "🏠 Menu": cmd_menu, "▶️ Run": cmd_run, "⏸ Stop": cmd_stop,
+               "📒 Orders": cmd_orders, "⚙️ Settings": cmd_settings_btn}
+    fn = actions.get((update.message.text or "").strip())
+    if fn:
+        await fn(update, ctx)
+
+
+async def cmd_keyboard(update: Update, ctx):
+    if not authorized(update):
+        return
+    if ctx.args and ctx.args[0].lower() == "off":
+        return await update.message.reply_text("⌨️ Neeche na buttons band karya.", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("⌨️ Neeche na buttons chalu. Type karvani jaroor nathi 👇", reply_markup=bottom_kb())
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     await update.message.reply_text(f"Your chat id: {update.effective_chat.id}")
+    await update.message.reply_text("⌨️ Neeche na buttons vapro, type karvani jaroor nathi 👇", reply_markup=bottom_kb())
     await update.message.reply_text(main_menu_text(), reply_markup=main_menu_kb())
 
 
@@ -2215,6 +2253,49 @@ async def _cmd_limit(update: Update, ctx, which: str):
     await update.message.reply_text(f"✅ {name} set: {limit_text(mode, value)}\nNavi trade thi lagu thase.")
 
 
+def _fsize(path) -> str:
+    try:
+        b = os.path.getsize(path)
+    except OSError:
+        return "nathi"
+    return f"{b / 1024:,.1f} KB" if b < 1024 * 1024 else f"{b / 1024 / 1024:,.2f} MB"
+
+
+def storage_text() -> str:
+    """Bot ni saved files ketli jagya roke che ane ketla divas no data che."""
+    vol = os.path.abspath(DATA_DIR) != os.path.abspath(BASE_DIR)
+    L = ["💾 Storage",
+         f"Folder: {DATA_DIR}",
+         ("✅ Alag DATA_DIR (Volume hoy to deploy par data nahi jay)" if vol else
+          "⚠️ DATA_DIR set nathi: Railway par darek deploy/restart par file delete thase"),
+         "",
+         f"bot_state.json: {_fsize(STATE_FILE)}",
+         f"trades_history.csv: {_fsize(HISTORY_FILE)}"]
+    try:
+        rows = read_history()
+        if rows:
+            dates = sorted({str(r.get("date") or "") for r in rows if r.get("date")})
+            L.append(f"History: {len(rows)} trades • {len(dates)} divas ({dates[0]} thi {dates[-1]})")
+            L.append(f"Roj no average: {len(rows) / max(1, len(dates)):.1f} trades")
+        else:
+            L.append("History: haju koi trade nathi")
+    except Exception as e:
+        L.append(f"History vanchay nahi: {e}")
+    L.append(f"Aaj na trades (state ma): {len(state['trades'])}")
+    try:
+        du = shutil.disk_usage(DATA_DIR)
+        L.append(f"Disk: {du.used / 1024 ** 3:,.2f} GB vaparyu / {du.total / 1024 ** 3:,.1f} GB (free {du.free / 1024 ** 3:,.2f} GB)")
+    except Exception:
+        pass
+    return "\n".join(L)
+
+
+async def cmd_storage(update: Update, ctx):
+    if not authorized(update):
+        return
+    await update.message.reply_text(await asyncio.to_thread(storage_text))
+
+
 async def cmd_strike(update: Update, ctx):
     global SELL_OFFSET
     if not authorized(update):
@@ -2400,6 +2481,8 @@ async def post_init(app: Application):
         BotCommand("testorder", "🧪 Angel One connection / order test"),
         BotCommand("orders", "📒 Angel One aaj na orders"),
         BotCommand("strike", "🎯 Sell strike (ATM / OTM / ITM)"),
+        BotCommand("storage", "💾 Saved data / storage"),
+        BotCommand("keyboard", "⌨️ Neeche na buttons (/keyboard off = band)"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -2413,9 +2496,17 @@ async def post_init(app: Application):
         BotCommand("help", "❓ Help"),
     ])
     await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    if restore_notes:
-        await notify(app, "♻️ Bot restart thayo, juno data restore karyo:\n" + "\n".join(restore_notes) +
-                     "\n\nBot STOPPED che. Navi entry mate /menu → 🟢 Run Bot.")
+    if ALLOWED_CHAT_ID:
+        try:
+            if restore_notes:
+                tail = ("\n\nBot RUNNING che." if state["running"]
+                        else "\n\nBot STOPPED che. Navi entry mate neeche ▶️ Run dabavo.")
+                msg = "♻️ Bot restart thayo, juno data restore karyo:\n" + "\n".join(restore_notes) + tail
+            else:
+                msg = "🟢 Bot online. Neeche na buttons vapro 👇"
+            await app.bot.send_message(ALLOWED_CHAT_ID, msg, reply_markup=bottom_kb())
+        except Exception as e:
+            log.warning("startup message fail: %s", e)
 
 
 # ----------------------------- DASHBOARD ------------------------------
@@ -3160,9 +3251,10 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_bottom_text))
     app.add_handler(CallbackQueryHandler(on_button))
     app.job_queue.run_repeating(tick, interval=LOOP_SECONDS, first=5)
     app.job_queue.run_repeating(fast_loop, interval=DASH_REFRESH, first=3)
