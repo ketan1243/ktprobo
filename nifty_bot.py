@@ -13,7 +13,7 @@ Install:
 Run:
     python nifty_bot.py
 Telegram commands:
-    /start /run /stop /status /mode paper|live /exit /pnl
+    /start /run /stop /status /mode paper|live /exit /pnl /newstrategy
 """
 import asyncio
 import csv
@@ -114,6 +114,8 @@ STRATEGIES = {
     "ema": {"label": f"EMA {EMA_FAST}/{EMA_SLOW} crossover", "line": f"EMA{EMA_SLOW}"},
     "rsi_wma": {"label": f"RSI{RSI_PERIOD} x WMA{RSI_WMA_LEN} + SMA{SMA_LEN}", "line": f"SMA{SMA_LEN}"},
 }
+_BUILTIN_STRATEGIES = {k: dict(v) for k, v in STRATEGIES.items()}   # built-in strategy backup (restore mate)
+MAX_CUSTOM_STRATEGIES = 15
 PRODUCT_TYPE = "INTRADAY"
 
 ENTRY_START = dtime(9, 20)
@@ -130,6 +132,7 @@ DAY_LIMIT_STEP = 500.0
 MAX_TRADES_ON = False        # divas na max trades nu limit ON/OFF
 MAX_TRADES_PER_DAY = 5        # ON hoy tyare: divas ma max ketla trade. Aatla thay pachhi aakho divas trading band
 ALERT_SOUND = True            # entry/exit Telegram alert sound sathe (False = silent notification)
+CANDLE_BREAKOUT = True        # badhi strategy ma extra condition: close > pichhli candle High (bullish) / close < pichhli candle Low (bearish)
 ONE_TRADE_PER_TREND = True   # profit/loss book thaya pachi same trend ma navi trade nahi (trend flip ni rah)
 HISTORY_DAYS = None          # None = auto (timeframe mujab). Indicator ma aagal na divas na candles ketla divas na levana
 ANGEL_MAX_DAYS = {1: 30, 3: 60, 5: 100, 10: 100, 15: 200, 30: 200}     # Angel One history limit per interval
@@ -979,6 +982,7 @@ def snapshot_settings() -> dict:
             "EXPIRY_MODE": EXPIRY_MODE, "EXPIRY_SKIP_TODAY": EXPIRY_SKIP_TODAY, "CANDLE_MINUTES": CANDLE_MINUTES,
             "DAY_LIMIT_ON": DAY_LIMIT_ON, "DAY_LOSS_LIMIT": DAY_LOSS_LIMIT, "DAY_PROFIT_LIMIT": DAY_PROFIT_LIMIT,
             "MAX_TRADES_ON": MAX_TRADES_ON, "MAX_TRADES_PER_DAY": MAX_TRADES_PER_DAY, "ALERT_SOUND": ALERT_SOUND,
+            "CANDLE_BREAKOUT": CANDLE_BREAKOUT,
             "strategy": state["strategy"]}
 
 
@@ -986,8 +990,9 @@ def apply_settings(st: dict):
     """Setting dict ne globals ma lagu kare (mode badalta / file load thata)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
     global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
-    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET, MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET, MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND, CANDLE_BREAKOUT
     st = st or {}
+    CANDLE_BREAKOUT = bool(st.get("CANDLE_BREAKOUT", CANDLE_BREAKOUT))
     _mt = int(st.get("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY))
     MAX_TRADES_PER_DAY = max(1, min(100, _mt)) if _mt > 0 else MAX_TRADES_PER_DAY
     # juni file ma ON/OFF nahotu: count > 0 hoy to ON gano
@@ -1071,7 +1076,7 @@ def _do_action(d: str, inactive: bool):
     """Setting button no sync action. Return (toast, alert)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND
     global HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY, DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
-    global MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
+    global MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND, CANDLE_BREAKOUT
     if d.startswith("set_"):
         _, key, val = d.split("_", 2)
         v = int(val)
@@ -1115,6 +1120,10 @@ def _do_action(d: str, inactive: bool):
                 state["day_halt"] = None                       # limit vadhari/OFF karyu to trading pacho chalu
         elif key == "snd":
             ALERT_SOUND = not ALERT_SOUND
+        elif key == "cbo":
+            CANDLE_BREAKOUT = not CANDLE_BREAKOUT
+            if not inactive:
+                _sig_cache["val"], _sig_cache["bucket"] = None, None      # signal pharithi gano
         elif key == "dres":
             if inactive:
                 return "Aa mode chalu nathi", True
@@ -1551,10 +1560,367 @@ def rsi_wma_calc(df: pd.DataFrame):
     return rsi, wma, sma, dirs
 
 
-def compute_signal(strategy: str, df: pd.DataFrame):
+# ------------------------ CUSTOM STRATEGY ENGINE ----------------------
+CUSTOM_FILE = os.path.join(DATA_DIR, "custom_strategies.json")   # tamari banavel strategy kayam save
+_PRICE_NAMES = {"close", "open", "high", "low"}
+_FUNCS = {"ema": 1, "sma": 1, "wma": 1, "rsi": 1, "rsiwma": 2, "macd": 2, "macdsig": 3, "st": 2, "stdir": 2}
+_OP_RE = re.compile(r"^(.+?)(>=|<=|==|=|>|<)(.+)$")
+_OPND_RE = re.compile(r"^([a-z]+)(?:\(([\d.,]+)\))?(?:\[(\d+)\])?$")
+_MIRROR_OP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "=": "="}
+CUSTOM_HELP = (
+    "➕ Navi strategy banavo\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "Niche mujab ek j message ma moklo 👇\n\n"
+    "name: RSI Trend\n"
+    "buy: close > ema(20) and rsi(14) > 55\n"
+    "sell: close < ema(20) and rsi(14) < 45\n\n"
+    "• buy = bullish (PE spread sell), sell = bearish (CE spread sell)\n"
+    "• 'sell:' na lakho to buy ni ulti condition aapo-aap banse (RSI no number 100-x thase)\n"
+    "• Ek line ma ghani condition 'and' thi jodo (badhi sachi hovi joiye)\n"
+    "• Koi condition match na thay to pehlano trend chalu rahe\n"
+    "• Candle breakout ON hoy to te pan badhi strategy ma lagu pade\n\n"
+    "Vapari shakay tevu:\n"
+    "close, open, high, low  (pachhli candle: high[1], low[1])\n"
+    "ema(n)  sma(n)  wma(n)  rsi(n)  rsiwma(n,m)\n"
+    "macd(fast,slow)  macdsig(fast,slow,sig)\n"
+    "st(period,mult) = supertrend line,  stdir(period,mult) = up / down\n"
+    "Operators: >  <  >=  <=  =\n\n"
+    "Example 2:\n"
+    "name: ST + EMA\n"
+    "buy: stdir(10,3) = up and ema(9) > ema(21)\n\n"
+    "Example 3:\n"
+    "name: Breakout\n"
+    "buy: close > high[1] and close > sma(20)"
+)
+
+
+def _parse_operand(t: str):
+    t = t.strip().lower().replace(" ", "")
+    if not t:
+        raise ValueError("Khali operand")
+    if t in ("up", "down"):
+        return ("num", 1.0 if t == "up" else -1.0)
+    try:
+        return ("num", float(t))
+    except ValueError:
+        pass
+    m = _OPND_RE.match(t)
+    if not m:
+        raise ValueError(f"'{t}' samjayu nahi")
+    name, args, shift = m.group(1), m.group(2), int(m.group(3) or 0)
+    if shift > 50:
+        raise ValueError("Shift [k] max 50")
+    if name in _PRICE_NAMES and args is None:
+        return ("price", name, shift, f"{name}[{shift}]" if shift else name)
+    if name in _FUNCS:
+        if args is None:
+            raise ValueError(f"{name}(...) ma number joiye")
+        try:
+            a = [float(x) for x in args.split(",") if x != ""]
+        except ValueError:
+            raise ValueError(f"{name}({args}) ma number kharab che")
+        if len(a) != _FUNCS[name]:
+            raise ValueError(f"{name}() ma {_FUNCS[name]} number joiye")
+        if name in ("st", "stdir"):
+            if not (1 <= a[0] <= 200 and a[0] == int(a[0]) and 0.1 <= a[1] <= 20):
+                raise ValueError(f"{name}(period 1-200, mult 0.1-20)")
+            a = [int(a[0]), float(a[1])]
+        else:
+            if any(x < 1 or x > 200 or x != int(x) for x in a):
+                raise ValueError(f"{name}() na number 1 thi 200 ni vachhe (purna sankhya) joiye")
+            a = [int(x) for x in a]
+        txt = f"{name}({','.join(f'{x:g}' for x in a)})" + (f"[{shift}]" if shift else "")
+        return ("fn", name, a, shift, txt)
+    raise ValueError(f"'{name}' indicator ni ovkhato nathi")
+
+
+def _op_text(o) -> str:
+    if o[0] == "num":
+        return f"{o[1]:g}"
+    return o[3] if o[0] == "price" else o[4]
+
+
+def _parse_cond(text: str):
+    t = text.strip().lower().replace(" ", "")
+    m = _OP_RE.match(t)
+    if not m:
+        raise ValueError(f"'{text.strip()}' ma operator (>  <  >=  <=  =) nathi")
+    lhs, op, rhs = _parse_operand(m.group(1)), m.group(2), _parse_operand(m.group(3))
+    op = "=" if op == "==" else op
+    if lhs[0] == "num" and rhs[0] == "num":
+        raise ValueError(f"'{text.strip()}' ma banne baju number che")
+    return (lhs, op, rhs)
+
+
+def _cond_text(c) -> str:
+    return f"{_op_text(c[0])} {c[1]} {_op_text(c[2])}"
+
+
+def _mirror_cond(c):
+    lhs, op, rhs = c
+    if rhs[0] == "num" and lhs[0] == "fn":
+        if lhs[1] in ("rsi", "rsiwma"):
+            rhs = ("num", 100.0 - rhs[1])
+        elif lhs[1] == "stdir" and op == "=":
+            rhs = ("num", -rhs[1])
+    if lhs[0] == "price" and lhs[1] == "close" and rhs[0] == "price" and rhs[1] in ("high", "low"):
+        rhs = ("price", "low" if rhs[1] == "high" else "high", rhs[2],
+               ("low" if rhs[1] == "high" else "high") + (f"[{rhs[2]}]" if rhs[2] else ""))   # breakout: high[1] <-> low[1]
+    return (lhs, _MIRROR_OP[op], rhs)
+
+
+def _rsi_series(c: pd.Series, n: int) -> pd.Series:
+    delta = c.diff()
+    up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    r = 100 - 100 / (1 + up / dn)
+    return r.mask(dn == 0, 100.0).mask((dn == 0) & (up == 0), 50.0)
+
+
+def _wma_series(s_: pd.Series, n: int) -> pd.Series:
+    w = np.arange(1, n + 1)
+    return s_.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
+
+
+def _op_series(o, df: pd.DataFrame, cache: dict) -> pd.Series:
+    if o[0] == "num":
+        return pd.Series(o[1], index=df.index)
+    key = _op_text(o)
+    if key in cache:
+        return cache[key]
+    c = df["close"]
+    if o[0] == "price":
+        ser = df[o[1]].shift(o[2]) if o[2] else df[o[1]]
+    else:
+        name, a, shift = o[1], o[2], o[3]
+        if name == "ema":
+            ser = c.ewm(span=a[0], adjust=False).mean()
+        elif name == "sma":
+            ser = c.rolling(a[0]).mean()
+        elif name == "wma":
+            ser = _wma_series(c, a[0])
+        elif name == "rsi":
+            ser = _rsi_series(c, a[0])
+        elif name == "rsiwma":
+            ser = _wma_series(_rsi_series(c, a[0]), a[1])
+        elif name == "macd":
+            ser = c.ewm(span=a[0], adjust=False).mean() - c.ewm(span=a[1], adjust=False).mean()
+        elif name == "macdsig":
+            m_ = c.ewm(span=a[0], adjust=False).mean() - c.ewm(span=a[1], adjust=False).mean()
+            ser = m_.ewm(span=a[2], adjust=False).mean()
+        else:                                           # st / stdir
+            d2 = supertrend(df, int(a[0]), float(a[1]))
+            ser = d2["st"] if name == "st" else d2["dir"].astype(float)
+        if shift:
+            ser = ser.shift(shift)
+    cache[key] = ser
+    return ser
+
+
+def _cond_series(c, df, cache) -> pd.Series:
+    a, b = _op_series(c[0], df, cache), _op_series(c[2], df, cache)
+    op = c[1]
+    if op == ">":
+        r = a > b
+    elif op == "<":
+        r = a < b
+    elif op == ">=":
+        r = a >= b
+    elif op == "<=":
+        r = a <= b
+    else:
+        r = (a - b).abs() < 1e-9
+    return r.fillna(False)
+
+
+def _custom_signal(spec: dict, df: pd.DataFrame):
+    """spec = STRATEGIES[key]. Return (direction, candle_time, reference_line)."""
+    cache = {}
+    bull = pd.Series(True, index=df.index)
+    for c in spec["bull"]:
+        bull = bull & _cond_series(c, df, cache)
+    bear = pd.Series(True, index=df.index)
+    for c in spec["bear"]:
+        bear = bear & _cond_series(c, df, cache)
+    dirs, cur = [], 0
+    for b_, r_ in zip(bull.values, bear.values):        # banne nahi (mixed) to pehlano trend chalu
+        if b_ and not r_:
+            cur = 1
+        elif r_ and not b_:
+            cur = -1
+        dirs.append(cur)
+    i = -2                                              # last COMPLETED candle
+
+    def val(o):
+        return float(_op_series(o, df, cache).iloc[i])
+
+    def part(c):
+        ok = bool(_cond_series(c, df, cache).iloc[i])
+        try:
+            return (f"{_op_text(c[0])} {val(c[0]):,.1f} {c[1]} {_op_text(c[2])} {val(c[2]):,.1f} "
+                    f"{'✔' if ok else '✘'}")
+        except Exception:
+            return f"{_cond_text(c)} {'✔' if ok else '✘'}"
+    _sig_cache["extra"] = ("BUY: " + "; ".join(part(c) for c in spec["bull"]) +
+                           " | SELL: " + "; ".join(part(c) for c in spec["bear"]))
+    ref = float(df["close"].iloc[i])
+    for c in spec["bull"]:
+        for o in (c[0], c[2]):
+            if o[0] == "fn" and o[1] != "stdir":
+                v = val(o)
+                if v == v:
+                    ref = v
+                    break
+        else:
+            continue
+        break
+    return dirs[i], df["time"].iloc[i], ref
+
+
+def _line_name(bull) -> str:
+    for c in bull:
+        for o in (c[0], c[2]):
+            if o[0] == "fn" and o[1] != "stdir":
+                return o[4].upper()
+    return "Close"
+
+
+def parse_strategy_text(txt: str) -> dict:
+    """Telegram message -> strategy spec. ValueError aape to user ne dekhadvano message."""
+    name, buy, sell = "", [], []
+    for raw in re.split(r"[\n;]+", txt):
+        ln = raw.strip()
+        if not ln:
+            continue
+        m = re.match(r"^(name|naam|buy|bull|long|sell|bear|short)\s*[:=]\s*(.+)$", ln, re.I)
+        if not m:
+            raise ValueError(f"Line samjayi nahi: '{ln}'\nShuruat name: / buy: / sell: thi karo.")
+        k, body = m.group(1).lower(), m.group(2).strip()
+        if k in ("name", "naam"):
+            name = re.sub(r"\s+", " ", body)[:28]
+            continue
+        conds = [x for x in re.split(r"\s+(?:and|&&|&)\s+", body, flags=re.I) if x.strip()]
+        (buy if k in ("buy", "bull", "long") else sell).extend(_parse_cond(x) for x in conds)
+    if not buy:
+        raise ValueError("Ochhama ochhi ek 'buy:' condition joiye.")
+    if len(buy) > 6 or len(sell) > 6:
+        raise ValueError("Ek side ma max 6 condition.")
+    auto = not sell
+    if auto:
+        sell = [_mirror_cond(c) for c in buy]
+    return {"name": name, "bull": buy, "bear": sell, "auto_mirror": auto}
+
+
+def _test_spec(spec: dict):
+    """Dummy data par chalavi ne check - error aave to save pehla j pakdai jay."""
+    rng = np.random.default_rng(1)
+    n = 400
+    close = 24000 + np.cumsum(rng.normal(0, 8, n))
+    df = pd.DataFrame({"time": pd.date_range("2026-01-01 09:15", periods=n, freq="3min"),
+                       "open": close - 1, "high": close + 4, "low": close - 4, "close": close, "volume": 1})
+    _custom_signal(spec, df)
+
+
+def _register_custom(key: str, label: str, bull: list, bear: list):
+    STRATEGIES[key] = {"label": label, "line": _line_name(bull), "custom": True, "bull": bull, "bear": bear}
+
+
+def save_custom_strategies():
+    try:
+        data = {"custom": {k: {"label": v["label"], "bull": [_cond_text(c) for c in v["bull"]],
+                               "bear": [_cond_text(c) for c in v["bear"]]}
+                           for k, v in STRATEGIES.items() if v.get("custom")},
+                "removed": [k for k in _BUILTIN_STRATEGIES if k not in STRATEGIES]}
+        tmp = CUSTOM_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1, ensure_ascii=False)
+        os.replace(tmp, CUSTOM_FILE)
+    except Exception as e:
+        log.warning("custom strategies save failed: %s", e)
+
+
+def ensure_valid_strategy():
+    if state["strategy"] not in STRATEGIES and STRATEGIES:
+        state["strategy"] = next(iter(STRATEGIES))
+
+
+def load_custom_strategies():
+    """Bot start par (load_state pehla) saved custom strategy ane remove kareli built-in lagu kare."""
+    if not os.path.exists(CUSTOM_FILE):
+        return
+    try:
+        with open(CUSTOM_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.warning("custom strategies vachay nahi: %s", e)
+        return
+    for k, v in (data.get("custom") or {}).items():
+        try:
+            _register_custom(k, v["label"], [_parse_cond(x) for x in v["bull"]],
+                             [_parse_cond(x) for x in v["bear"]])
+        except Exception as e:
+            log.warning("custom strategy %s skip: %s", k, e)
+    for k in data.get("removed") or []:
+        if k in STRATEGIES and not STRATEGIES[k].get("custom") and len(STRATEGIES) > 1:
+            STRATEGIES.pop(k, None)
+    ensure_valid_strategy()
+
+
+def add_custom_strategy(txt: str):
+    """Return (key, label, spec). ValueError aape to message user ne batavo."""
+    if sum(1 for v in STRATEGIES.values() if v.get("custom")) >= MAX_CUSTOM_STRATEGIES:
+        raise ValueError(f"Max {MAX_CUSTOM_STRATEGIES} custom strategy. Pehla koi juni remove karo.")
+    spec = parse_strategy_text(txt)
+    n = 1
+    while f"c{n}" in STRATEGIES:
+        n += 1
+    key = f"c{n}"
+    label = spec["name"] or f"Custom {n}"
+    if any(v["label"].lower() == label.lower() for v in STRATEGIES.values()):
+        raise ValueError(f"'{label}' naam pehla thi che. Biju naam aapo.")
+    _test_spec(spec)
+    _register_custom(key, label, spec["bull"], spec["bear"])
+    save_custom_strategies()
+    return key, label, spec
+
+
+def strategy_in_use(key: str) -> bool:
+    if state["strategy"] == key:
+        return True
+    return any((PROFILES.get(p) or {}).get("strategy") == key for p in ("paper", "live"))
+
+
+def remove_strategy(key: str):
+    """Error text athva None (sachu remove thayu)."""
+    if key not in STRATEGIES:
+        return "Aa strategy pehla thi nathi"
+    if len(STRATEGIES) <= 1:
+        return "Chhelli strategy delete nahi thay"
+    if strategy_in_use(key):
+        return "Aa strategy Paper/Live ma select che. Pehla biji strategy select karo."
+    STRATEGIES.pop(key)
+    save_custom_strategies()
+    return None
+
+
+def restore_builtin_strategies():
+    for k, v in _BUILTIN_STRATEGIES.items():
+        STRATEGIES.setdefault(k, dict(v))
+    save_custom_strategies()
+
+
+def strategy_detail(key: str) -> str:
+    v = STRATEGIES[key]
+    return (f"• {v['label']} (custom)\n   BUY: " + " AND ".join(_cond_text(c) for c in v["bull"]) +
+            "\n   SELL: " + " AND ".join(_cond_text(c) for c in v["bear"]))
+
+
+def _strategy_signal(strategy: str, df: pd.DataFrame):
     """Return (direction, candle_time, reference_line). direction: 1 = bullish, -1 = bearish.
     Last COMPLETED candle (iloc[-2]) par j signal."""
     _sig_cache["extra"] = ""
+    if STRATEGIES.get(strategy, {}).get("custom"):
+        return _custom_signal(STRATEGIES[strategy], df)
     if strategy == "ema":
         fast = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
         slow = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
@@ -1572,6 +1938,22 @@ def compute_signal(strategy: str, df: pd.DataFrame):
     d2 = supertrend(df)
     row = d2.iloc[-2]
     return int(row["dir"]), row["time"], float(row["st"])
+
+
+def compute_signal(strategy: str, df: pd.DataFrame):
+    """Strategy signal + (ON hoy to) candle breakout condition:
+    bullish: chhelli band candle no close > tena pehlani candle no High
+    bearish: chhelli band candle no close < tena pehlani candle no Low
+    Condition na male to signal neutral (0) = navi entry/flip nahi; strategy trend ave to pachhi ni candle ma male to j entry."""
+    d, ct, ref = _strategy_signal(strategy, df)
+    if not CANDLE_BREAKOUT or d == 0 or len(df) < 4:
+        return d, ct, ref
+    c, prev_h, prev_l = float(df["close"].iloc[-2]), float(df["high"].iloc[-3]), float(df["low"].iloc[-3])
+    ok = (c > prev_h) if d == 1 else (c < prev_l)
+    note = (f"Breakout: close {c:,.1f} {'>' if d == 1 else '<'} prev {'High' if d == 1 else 'Low'} "
+            f"{prev_h if d == 1 else prev_l:,.1f} {'OK' if ok else 'pending'}")
+    _sig_cache["extra"] = (_sig_cache["extra"] + " | " if _sig_cache.get("extra") else "") + note
+    return (d if ok else 0), ct, ref
 
 
 def current_signal():
@@ -2071,9 +2453,34 @@ async def on_bottom_text(update: Update, ctx):
         return
     actions = {"📺 Dashboard": cmd_dashboard, "🏠 Menu": cmd_menu, "▶️ Run": cmd_run, "⏸ Stop": cmd_stop,
                "📒 Orders": cmd_orders, "⚙️ Settings": cmd_settings_btn}
-    fn = actions.get((update.message.text or "").strip())
+    txt = (update.message.text or "").strip()
+    fn = actions.get(txt)
     if fn:
+        ctx.user_data.pop("await_strat", None)
         await fn(update, ctx)
+        return
+    if ctx.user_data.get("await_strat"):                  # navi strategy no text vaanchvo
+        try:
+            key, label, spec = add_custom_strategy(txt)
+        except ValueError as e:
+            return await update.message.reply_text(f"❌ {e}\n\nSudhari ne fari moklo. (Cancel: /menu → Strategy → ➕ → Cancel)")
+        except Exception as e:
+            return await update.message.reply_text(f"❌ Strategy banti nathi: {e}")
+        ctx.user_data.pop("await_strat", None)
+        note = " (ulti condition aapo-aap)" if spec["auto_mirror"] else ""
+        await update.message.reply_text(
+            f"✅ Navi strategy save thai: {label}\n"
+            f"BUY (PE spread): " + " AND ".join(_cond_text(c) for c in spec["bull"]) + "\n"
+            f"SELL (CE spread){note}: " + " AND ".join(_cond_text(c) for c in spec["bear"]),
+            reply_markup=Markup([[Btn("✅ Aa strategy select karo", callback_data=f"strat_{key}")],
+                                 [Btn("🧠 Strategy menu", callback_data="strategy")]]))
+
+
+async def cmd_newstrategy(update: Update, ctx):
+    if not authorized(update):
+        return
+    ctx.user_data["await_strat"] = True
+    await update.message.reply_text(CUSTOM_HELP)
 
 
 async def cmd_keyboard(update: Update, ctx):
@@ -2234,14 +2641,22 @@ def main_menu_kb() -> Markup:
     ])
 
 
+_BUILTIN_DESC = {
+    "supertrend": "• Supertrend: Green → PE spread, Red → CE spread",
+    "ema": f"• EMA {EMA_FAST}/{EMA_SLOW}: EMA{EMA_FAST} > EMA{EMA_SLOW} → PE spread, niche → CE spread",
+    "rsi_wma": (f"• RSI{RSI_PERIOD} x WMA{RSI_WMA_LEN} + SMA{SMA_LEN}: RSI > WMA ane close > SMA → PE spread; "
+                f"RSI < WMA ane close < SMA → CE spread (candle close par)"),
+}
+
+
 def strategy_text() -> str:
+    lines = [_BUILTIN_DESC[k] for k, v in STRATEGIES.items() if not v.get("custom") and k in _BUILTIN_DESC]
+    lines += [strategy_detail(k) for k, v in STRATEGIES.items() if v.get("custom")]
     return ("🧠 Strategy select karo\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"Active: {strategy_label()}  •  ⏱ {CANDLE_MINUTES} min\n\n"
-            f"• Supertrend: Green → PE spread, Red → CE spread\n"
-            f"• EMA {EMA_FAST}/{EMA_SLOW}: EMA{EMA_FAST} > EMA{EMA_SLOW} → PE spread, niche → CE spread\n"
-            f"• RSI{RSI_PERIOD} x WMA{RSI_WMA_LEN} + SMA{SMA_LEN}: RSI > WMA ane close > SMA → PE spread; "
-            f"RSI < WMA ane close < SMA → CE spread (candle close par)\n\n"
+            + "\n".join(lines) + "\n\n"
+            "➕ Navi strategy (potani condition sathe) umervā ane 🗑 juni remove karva niche buttons che.\n"
             "⏱ Timeframe niche thi select karo (badha strategy ma lagu).\n"
             "⚠️ Strategy/timeframe badalta bot pause thase (Run pharithi dabavo).\n"
             "Position open hoy tyare badli nahi shakay.")
@@ -2250,6 +2665,7 @@ def strategy_text() -> str:
 def strategy_kb() -> Markup:
     rows = [[Btn(("✅ " if k == state["strategy"] else "") + v["label"], callback_data=f"strat_{k}")]
             for k, v in STRATEGIES.items()]
+    rows.append([Btn("➕ Navi Strategy", callback_data="sx_new"), Btn("🗑 Strategy Remove", callback_data="sx_del")])
     tf = [Btn(("✅ " if m == CANDLE_MINUTES else "") + f"{m}m", callback_data=f"tf_{m}") for m in TIMEFRAMES]
     rows.append([Btn("⏱ Timeframe", callback_data="noop")])
     rows.append(tf[:3])
@@ -2386,6 +2802,7 @@ def settings_text(prof=None) -> str:
             f"Signal flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}\n"
             f"{day_limit_text()}\n"
             f"🔢 Max trades/day: {('ON (' + str(MAX_TRADES_PER_DAY) + ')') if MAX_TRADES_ON else 'OFF'}\n"
+            f"🕯 Candle breakout: {'ON (close > pichhli High / < pichhli Low)' if CANDLE_BREAKOUT else 'OFF'}\n"
             f"🔔 Alert sound: {'ON' if ALERT_SOUND else 'OFF (silent)'} • chat: "
             f"{'alag' if alert_chat(prof) != ALLOWED_CHAT_ID else 'main'}\n"
             f"🕒 Time: {ENTRY_START:%H:%M} - {LAST_ENTRY:%H:%M} (exit {FORCE_EXIT:%H:%M}) • "
@@ -2423,6 +2840,7 @@ def settings_kb(prof=None) -> Markup:
         [Btn(f"🔢 Max trades/day: {'ON' if MAX_TRADES_ON else 'OFF'} 🔄", callback_data="set_mton_0")],
         *([[Btn("➖", callback_data="set_mtd_-1"), Btn(f"Trades: {MAX_TRADES_PER_DAY}", callback_data="noop"),
             Btn("➕", callback_data="set_mtd_1")]] if MAX_TRADES_ON else []),
+        [Btn(f"🕯 Candle breakout: {'ON' if CANDLE_BREAKOUT else 'OFF'} 🔄", callback_data="set_cbo_0")],
         [Btn(f"🔔 Alert sound: {'ON' if ALERT_SOUND else 'OFF'} 🔄", callback_data="set_snd_0")],
         *dl_rows,
         [Btn(f"📋 {'LIVE' if prof == 'paper' else 'PAPER'} ni setting ahi copy karo", callback_data="set_copy_0")],
@@ -2517,7 +2935,59 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _ans(q, toast or None, show_alert=alert) if toast else await _ans(q)
         await show(text, kb)
 
+    async def _handle_sx(inner, prefix):
+        """Navi strategy add / juni strategy remove na buttons. prefix = 'cfg|<prof>|' athva ''."""
+        prof = prefix.split("|")[1] if prefix else state["mode"]
+        back = prefix + "strategy"
+
+        async def del_page():
+            rows = [[Btn(f"🗑 {v['label']}{' (select che)' if strategy_in_use(k) else ''}",
+                         callback_data=f"{prefix}sx_ask_{k}")] for k, v in STRATEGIES.items()]
+            rows.append([Btn("♻️ Built-in strategy pacha lavo", callback_data=prefix + "sx_restore")])
+            rows.append([Btn("⬅️ Back", callback_data=back)])
+            await show("🗑 Kai strategy remove karvi che?\n━━━━━━━━━━━━━━━━━━\n"
+                       "Paper/Live ma select hoy te remove nahi thay.", Markup(rows))
+
+        if inner == "sx_new":
+            ctx.user_data["await_strat"] = True
+            await _ans(q)
+            return await show(CUSTOM_HELP, Markup([[Btn("❌ Cancel", callback_data=prefix + "sx_cancel")]]))
+        if inner == "sx_cancel":
+            ctx.user_data.pop("await_strat", None)
+            await _ans(q, "Cancel")
+            return await _handle_cfg(prof, "strategy")
+        if inner == "sx_del":
+            await _ans(q)
+            return await del_page()
+        if inner.startswith("sx_ask_"):
+            key = inner[7:]
+            if key not in STRATEGIES:
+                await _ans(q, "Aa strategy nathi", show_alert=True)
+                return await del_page()
+            if strategy_in_use(key):
+                return await _ans(q, "Aa strategy Paper/Live ma select che. Pehla biji select karo.", show_alert=True)
+            await _ans(q)
+            v = STRATEGIES[key]
+            body = strategy_detail(key) if v.get("custom") else _BUILTIN_DESC.get(key, v["label"])
+            return await show(f"⚠️ Pakka remove karvi?\n\n{body}",
+                              Markup([[Btn("✅ Haa, remove", callback_data=f"{prefix}sx_ok_{key}"),
+                                       Btn("❌ Na", callback_data=prefix + "sx_del")]]))
+        if inner.startswith("sx_ok_"):
+            err = remove_strategy(inner[6:])
+            await _ans(q, err or "Remove thayu ✅", show_alert=bool(err))
+            return await del_page()
+        if inner == "sx_restore":
+            restore_builtin_strategies()
+            await _ans(q, "Built-in strategy pacha aavi ✅")
+            return await del_page()
+        await _ans(q)
+
     try:
+        if d.startswith("sx_"):
+            return await _handle_sx(d, "")
+        if d.startswith("cfg|") and d.split("|", 2)[2].startswith("sx_"):
+            _, prof_x, inner_x = d.split("|", 2)
+            return await _handle_sx(inner_x, f"cfg|{prof_x}|")
         if d == "settings":
             await _ans(q)
             text_, kb_ = settings_hub()
@@ -3056,6 +3526,19 @@ async def cmd_maxtrades(update: Update, ctx):
     await update.message.reply_text("✅ Max trades/day: " + (f"ON ({MAX_TRADES_PER_DAY})" if MAX_TRADES_ON else "OFF"))
 
 
+async def cmd_breakout(update: Update, ctx):
+    global CANDLE_BREAKOUT
+    if not authorized(update):
+        return
+    if ctx.args and ctx.args[0].lower() in ("on", "off"):
+        CANDLE_BREAKOUT = ctx.args[0].lower() == "on"
+        _sig_cache["val"], _sig_cache["bucket"] = None, None
+        save_state()
+    await update.message.reply_text(
+        f"🕯 Candle breakout ({state['mode'].upper()}): {'ON' if CANDLE_BREAKOUT else 'OFF'}\n"
+        "Bullish: close > pichhli candle High\nBearish: close < pichhli candle Low\n/breakout on | /breakout off")
+
+
 async def cmd_sound(update: Update, ctx):
     global ALERT_SOUND
     if not authorized(update):
@@ -3168,6 +3651,8 @@ async def post_init(app: Application):
         BotCommand("sync", "📥 Angel orders thi trades bot ma umero"),
         BotCommand("maxtrades", "🔢 Max trades per day"),
         BotCommand("sound", "🔔 Alert sound ON/OFF"),
+        BotCommand("breakout", "🕯 Candle breakout condition ON/OFF"),
+        BotCommand("newstrategy", "➕ Navi strategy + condition add"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -3933,7 +4418,9 @@ async def cmd_export(update: Update, ctx):
 
 # ----------------------------- BOOT -----------------------------------
 def main():
+    load_custom_strategies()      # custom strategy + remove kareli built-in (load_state pehla)
     load_state()
+    ensure_valid_strategy()
     angel_login()
     load_scrips()
     start_ws()
@@ -3948,7 +4435,7 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid), ("breakout", cmd_breakout), ("newstrategy", cmd_newstrategy)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_bottom_text))
