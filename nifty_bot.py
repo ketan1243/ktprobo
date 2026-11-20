@@ -2390,13 +2390,23 @@ async def notify_trade(app: Application, text: str, mode: str, loud: bool = Fals
     log.error("ALERT badhi chat ma fail thayu: %s", text[:80])
 
 
+async def _delayed_test_alert(context: ContextTypes.DEFAULT_TYPE):
+    chat, silent = context.job.data
+    try:
+        await _send_retry(context.application, chat, "🔔 TEST ALERT (delay pachhi) - sound aavyo?", silent)
+    except Exception as e:
+        log.warning("delayed test alert fail: %s", e)
+
+
 async def cmd_testalert(update: Update, ctx):
-    """Trade alert chalse ke nahi te check: alert chat ma sound sathe test message moklse ane error batavse."""
+    """Trade alert chalse ke nahi te check. /testalert = turant, /testalert 10 = 10 sec pachhi
+    (e daramyan Telegram minimize / phone lock karo - khuli chat ma sound nathi vagadtu)."""
     if not authorized(update):
         return
     mode = state["mode"]
     chat = alert_chat(mode) or state.get("fallback_chat")
     here = update.effective_chat.id
+    delay = max(5, min(120, int(ctx.args[0]))) if ctx.args and ctx.args[0].isdigit() else 0
     L = [f"🔔 Alert test ({mode.upper()})",
          f"Alert chat id: {chat or 'NATHI'}",
          f"Aa chat j che? {'Haa' if chat == here else 'Na, alag chat/group ma jashe'}",
@@ -2404,12 +2414,18 @@ async def cmd_testalert(update: Update, ctx):
     if not chat:
         L.append("❌ Chat id nathi. .env ma TELEGRAM_CHAT_ID set karo (id jaanva /chatid).")
         return await update.message.reply_text("\n".join(L))
+    if delay:
+        ctx.application.job_queue.run_once(_delayed_test_alert, delay, data=(chat, not ALERT_SOUND))
+        L.append(f"⏱ {delay} sec pachhi test alert aavse.")
+        L.append("Have Telegram band/minimize karo (Desktop pan band karo) ane phone lock karo, pachhi sound sambhdo.")
+        return await update.message.reply_text("\n".join(L))
     try:
         await _send_retry(ctx.application, chat, "🔔 TEST ALERT - aa message sound sathe aavvo joiye.", not ALERT_SOUND)
         L.append("✅ Message moklayo.")
         if chat != here:
             L.append("👉 Te alert chat/group ma check karo.")
-        L.append("Sound na aave to: e chat Telegram ma Mute na hoy, ane phone ma Telegram na Notification/Sound permission ON hoy.")
+        L.append("⚠️ Aa chat khuli hoy to sound nahi vagey. Sacho test: /testalert 10 (pachhi Telegram minimize + phone lock).")
+        L.append("Tya pan sound na aave to: chat Mute na hoy, phone ma Telegram Notification/Sound permission ON hoy, DND band hoy.")
     except Exception as e:
         L.append(f"❌ Fail: {e}")
         L.append("Chat id khotu hoy athva bot e group ma add nathi/block che. Group ma bot add karo ane /chatid thi sacho id lyo.")
@@ -3748,7 +3764,7 @@ async def post_init(app: Application):
         BotCommand("sound", "🔔 Alert sound ON/OFF"),
         BotCommand("breakout", "🕯 Candle breakout condition ON/OFF"),
         BotCommand("newstrategy", "➕ Navi strategy + condition add"),
-        BotCommand("testalert", "🔔 Trade alert / sound test"),
+        BotCommand("testalert", "🔔 Alert / sound test (/testalert 10 = 10 sec pachhi)"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
