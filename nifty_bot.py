@@ -127,7 +127,8 @@ DAY_LIMIT_ON = False          # divas nu profit/loss limit ON/OFF (Telegram Sett
 DAY_LOSS_LIMIT = 2000.0       # ₹ - divas no total loss aatlo thay to aaj nu trading band
 DAY_PROFIT_LIMIT = 3000.0     # ₹ - divas no total profit aatlo thay to aaj nu trading band
 DAY_LIMIT_STEP = 500.0
-MAX_TRADES_PER_DAY = 0        # divas ma max ketla trade (0 = OFF). Aatla thay pachhi aakho divas trading band
+MAX_TRADES_ON = False        # divas na max trades nu limit ON/OFF
+MAX_TRADES_PER_DAY = 5        # ON hoy tyare: divas ma max ketla trade. Aatla thay pachhi aakho divas trading band
 ALERT_SOUND = True            # entry/exit Telegram alert sound sathe (False = silent notification)
 ONE_TRADE_PER_TREND = True   # profit/loss book thaya pachi same trend ma navi trade nahi (trend flip ni rah)
 HISTORY_DAYS = None          # None = auto (timeframe mujab). Indicator ma aagal na divas na candles ketla divas na levana
@@ -977,7 +978,7 @@ def snapshot_settings() -> dict:
             "ONE_TRADE_PER_TREND": ONE_TRADE_PER_TREND, "HISTORY_DAYS": HISTORY_DAYS,
             "EXPIRY_MODE": EXPIRY_MODE, "EXPIRY_SKIP_TODAY": EXPIRY_SKIP_TODAY, "CANDLE_MINUTES": CANDLE_MINUTES,
             "DAY_LIMIT_ON": DAY_LIMIT_ON, "DAY_LOSS_LIMIT": DAY_LOSS_LIMIT, "DAY_PROFIT_LIMIT": DAY_PROFIT_LIMIT,
-            "MAX_TRADES_PER_DAY": MAX_TRADES_PER_DAY, "ALERT_SOUND": ALERT_SOUND,
+            "MAX_TRADES_ON": MAX_TRADES_ON, "MAX_TRADES_PER_DAY": MAX_TRADES_PER_DAY, "ALERT_SOUND": ALERT_SOUND,
             "strategy": state["strategy"]}
 
 
@@ -985,9 +986,12 @@ def apply_settings(st: dict):
     """Setting dict ne globals ma lagu kare (mode badalta / file load thata)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
     global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
-    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET, MAX_TRADES_PER_DAY, ALERT_SOUND
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET, MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
     st = st or {}
-    MAX_TRADES_PER_DAY = max(0, min(100, int(st.get("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY))))
+    _mt = int(st.get("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY))
+    MAX_TRADES_PER_DAY = max(1, min(100, _mt)) if _mt > 0 else MAX_TRADES_PER_DAY
+    # juni file ma ON/OFF nahotu: count > 0 hoy to ON gano
+    MAX_TRADES_ON = bool(st["MAX_TRADES_ON"]) if "MAX_TRADES_ON" in st else (_mt > 0)
     ALERT_SOUND = bool(st.get("ALERT_SOUND", ALERT_SOUND))
     LOTS = int(st.get("LOTS", LOTS))
     HEDGE_PCT = float(st.get("HEDGE_PCT", HEDGE_PCT))
@@ -1067,7 +1071,7 @@ def _do_action(d: str, inactive: bool):
     """Setting button no sync action. Return (toast, alert)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND
     global HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY, DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
-    global MAX_TRADES_PER_DAY, ALERT_SOUND
+    global MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
     if d.startswith("set_"):
         _, key, val = d.split("_", 2)
         v = int(val)
@@ -1101,11 +1105,14 @@ def _do_action(d: str, inactive: bool):
             DAY_LOSS_LIMIT = max(DAY_LIMIT_STEP, min(200000.0, DAY_LOSS_LIMIT + v * DAY_LIMIT_STEP))
         elif key == "dlp":
             DAY_PROFIT_LIMIT = max(DAY_LIMIT_STEP, min(200000.0, DAY_PROFIT_LIMIT + v * DAY_LIMIT_STEP))
-        elif key == "mtd":
-            MAX_TRADES_PER_DAY = max(0, min(100, MAX_TRADES_PER_DAY + v))
+        elif key in ("mtd", "mton"):
+            if key == "mton":
+                MAX_TRADES_ON = not MAX_TRADES_ON
+            else:
+                MAX_TRADES_PER_DAY = max(1, min(100, MAX_TRADES_PER_DAY + v))
             if not inactive and str(state.get("day_halt") or "").startswith("MAX TRADES") \
                     and max_trades_reason(after_close=True) is None:
-                state["day_halt"] = None                       # limit vadhari to trading pacho chalu
+                state["day_halt"] = None                       # limit vadhari/OFF karyu to trading pacho chalu
         elif key == "snd":
             ALERT_SOUND = not ALERT_SOUND
         elif key == "dres":
@@ -1754,7 +1761,7 @@ async def open_position(direction: int, app: Application):
     await notify_trade(app,
         f"✅ {state['mode'].upper()} ENTRY • {opt_type} • SELL {_strike_txt(sell_opt['symbol'])} @{sell_px:.2f} / "
         f"BUY {_strike_txt(hedge_opt['symbol'])} @{hedge_px:.2f}\n"
-        f"{strategy_label()} {'UP 🟢' if direction == 1 else 'DOWN 🔴'} • Trade {n_tr}" + (f"/{MAX_TRADES_PER_DAY}" if MAX_TRADES_PER_DAY else "") + "\n"
+        f"{strategy_label()} {'UP 🟢' if direction == 1 else 'DOWN 🔴'} • Trade {n_tr}" + (f"/{max_trades_limit()}" if max_trades_limit() else "") + "\n"
         f"SELL {sell_opt['symbol']} @ {sell_px:.2f}  ({sel_lbl}, Nifty {spot:,.0f})\n"
         f"BUY  {hedge_opt['symbol']} @ {hedge_px:.2f}  (hedge, sell strike thi bahar)\n"
         f"Expiry: {expiry:%d %b %Y} ({EXPIRY_MODES[EXPIRY_MODE].split(' (')[0]})\n"
@@ -1846,7 +1853,7 @@ async def _close_position(app: Application, reason: str):
         extra = "\n⏸ Same trend ma navi trade nahi, trend flip ni rah."
     await notify_trade(app, f"🔴 {mode.upper()} EXIT • {reason} • {money(pnl)}\n{trade_block(trade)}\n"
                             f"Day PnL ({mode}): {money(mode_realized())}"
-                            + (f" • Trade {len(mode_trades())}/{MAX_TRADES_PER_DAY}" if MAX_TRADES_PER_DAY else "")
+                            + (f" • Trade {len(mode_trades())}/{max_trades_limit()}" if max_trades_limit() else "")
                             + f"{extra}{live_txt}", mode)
     lim = day_limit_reason(mode_realized()) or max_trades_reason(after_close=True)
     if lim:
@@ -1914,12 +1921,18 @@ def trades_count_today() -> int:
     return len(mode_trades()) + (1 if state.get("position") else 0)
 
 
+def max_trades_limit() -> int:
+    """ON hoy to limit (count), OFF hoy to 0."""
+    return MAX_TRADES_PER_DAY if MAX_TRADES_ON else 0
+
+
 def max_trades_reason(after_close: bool = False):
-    if not MAX_TRADES_PER_DAY or state["limit_override"]:
+    lim = max_trades_limit()
+    if not lim or state["limit_override"]:
         return None
     n = len(mode_trades()) if after_close else trades_count_today()
-    if n >= MAX_TRADES_PER_DAY:
-        return f"MAX TRADES/DAY ({n}/{MAX_TRADES_PER_DAY})"
+    if n >= lim:
+        return f"MAX TRADES/DAY ({n}/{lim})"
     return None
 
 
@@ -2372,7 +2385,7 @@ def settings_text(prof=None) -> str:
             f"📅 Expiry: {expiry_label()}\n"
             f"Signal flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}\n"
             f"{day_limit_text()}\n"
-            f"🔢 Max trades/day: {MAX_TRADES_PER_DAY if MAX_TRADES_PER_DAY else 'OFF'}\n"
+            f"🔢 Max trades/day: {('ON (' + str(MAX_TRADES_PER_DAY) + ')') if MAX_TRADES_ON else 'OFF'}\n"
             f"🔔 Alert sound: {'ON' if ALERT_SOUND else 'OFF (silent)'} • chat: "
             f"{'alag' if alert_chat(prof) != ALLOWED_CHAT_ID else 'main'}\n"
             f"🕒 Time: {ENTRY_START:%H:%M} - {LAST_ENTRY:%H:%M} (exit {FORCE_EXIT:%H:%M}) • "
@@ -2407,9 +2420,9 @@ def settings_kb(prof=None) -> Markup:
         [Btn("🧠 Strategy & Timeframe", callback_data="strategy")],
         [Btn("📅 Expiry select", callback_data="expiry"), Btn("🕒 Time & Rules", callback_data="rules")],
         [Btn(f"🔁 Flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}", callback_data="set_flip_0")],
-        [Btn("-5", callback_data="set_mtd_-5"), Btn("➖", callback_data="set_mtd_-1"),
-         Btn(f"🔢 Max/day: {MAX_TRADES_PER_DAY if MAX_TRADES_PER_DAY else 'OFF'}", callback_data="noop"),
-         Btn("➕", callback_data="set_mtd_1"), Btn("+5", callback_data="set_mtd_5")],
+        [Btn(f"🔢 Max trades/day: {'ON' if MAX_TRADES_ON else 'OFF'} 🔄", callback_data="set_mton_0")],
+        *([[Btn("➖", callback_data="set_mtd_-1"), Btn(f"Trades: {MAX_TRADES_PER_DAY}", callback_data="noop"),
+            Btn("➕", callback_data="set_mtd_1")]] if MAX_TRADES_ON else []),
         [Btn(f"🔔 Alert sound: {'ON' if ALERT_SOUND else 'OFF'} 🔄", callback_data="set_snd_0")],
         *dl_rows,
         [Btn(f"📋 {'LIVE' if prof == 'paper' else 'PAPER'} ni setting ahi copy karo", callback_data="set_copy_0")],
@@ -3021,23 +3034,26 @@ def _test_order_roundtrip() -> str:
 
 
 async def cmd_maxtrades(update: Update, ctx):
-    global MAX_TRADES_PER_DAY
+    global MAX_TRADES_PER_DAY, MAX_TRADES_ON
     if not authorized(update):
         return
+    cur = f"ON ({MAX_TRADES_PER_DAY})" if MAX_TRADES_ON else f"OFF (value {MAX_TRADES_PER_DAY})"
+    usage = f"🔢 Max trades/day ({state['mode'].upper()}): {cur}\n\n/maxtrades on | off\n/maxtrades 8   (8 set karine ON)"
     if not ctx.args:
-        return await update.message.reply_text(
-            f"🔢 Max trades/day ({state['mode'].upper()}): {MAX_TRADES_PER_DAY or 'OFF'}\n\n/maxtrades 5\n/maxtrades off")
+        return await update.message.reply_text(usage)
     a = ctx.args[0].lower()
-    if a in ("off", "0"):
-        MAX_TRADES_PER_DAY = 0
+    if a == "off":
+        MAX_TRADES_ON = False
+    elif a == "on":
+        MAX_TRADES_ON = True
     elif a.isdigit() and 1 <= int(a) <= 100:
-        MAX_TRADES_PER_DAY = int(a)
+        MAX_TRADES_PER_DAY, MAX_TRADES_ON = int(a), True
     else:
-        return await update.message.reply_text("❌ 1 thi 100 vache number lakho, athva /maxtrades off")
+        return await update.message.reply_text("❌ Samajyu nahi.\n\n" + usage)
     if str(state.get("day_halt") or "").startswith("MAX TRADES") and max_trades_reason(after_close=True) is None:
         state["day_halt"] = None
     save_state()
-    await update.message.reply_text(f"✅ Max trades/day ({state['mode'].upper()}): {MAX_TRADES_PER_DAY or 'OFF'}")
+    await update.message.reply_text("✅ Max trades/day: " + (f"ON ({MAX_TRADES_PER_DAY})" if MAX_TRADES_ON else "OFF"))
 
 
 async def cmd_sound(update: Update, ctx):
@@ -3431,7 +3447,7 @@ async def dashboard_text() -> str:
     worst = min((t["pnl"] for t in tr), default=0)
     L.append(f"<b>📅 TODAY</b>  {'🟢' if total >= 0 else '🔴'} <b>{money(total)}</b>")
     L.append(kv([
-        ("Trades", f"{len(tr)}{'/' + str(MAX_TRADES_PER_DAY) if MAX_TRADES_PER_DAY else ''}   ✅{wins} ❌{len(tr) - wins}"),
+        ("Trades", f"{len(tr)}{'/' + str(max_trades_limit()) if max_trades_limit() else ''}   ✅{wins} ❌{len(tr) - wins}"),
         ("Win", f"{bar(wr)} {wr * 100:.0f}%" if tr else "-"),
         ("Realized", money(mode_realized())),
         ("Open", money(open_pnl)),
@@ -3480,7 +3496,7 @@ async def dashboard_compact_text() -> str:
     tr = mode_trades()
     wins = sum(1 for t in tr if t["pnl"] > 0)
     total = mode_realized() + open_pnl
-    L.append(f"📅 {'🟢' if total >= 0 else '🔴'} <b>{money(total)}</b> • {len(tr)}{'/' + str(MAX_TRADES_PER_DAY) if MAX_TRADES_PER_DAY else ''} trades ✅{wins} ❌{len(tr) - wins}")
+    L.append(f"📅 {'🟢' if total >= 0 else '🔴'} <b>{money(total)}</b> • {len(tr)}{'/' + str(max_trades_limit()) if max_trades_limit() else ''} trades ✅{wins} ❌{len(tr) - wins}")
     if state["day_halt"]:
         L.append("🛑 Daily limit hit: aaj trading band")
     elif DAY_LIMIT_ON:
