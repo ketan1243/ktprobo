@@ -917,6 +917,7 @@ def save_state():
             "dash_compact": state["dash_compact"],
             "strategy": state["strategy"],
             "fallback_chat": state.get("fallback_chat"),
+            "bottom_kb": bool(state.get("bottom_kb", False)),
             "blocked_dir": state["blocked_dir"],
             "day_halt": state["day_halt"],
             "limit_override": state["limit_override"],
@@ -1301,6 +1302,7 @@ def load_state():
     state["dash_chat"] = d.get("dash_chat")
     state["dash_compact"] = bool(d.get("dash_compact", False))
     state["fallback_chat"] = d.get("fallback_chat")
+    state["bottom_kb"] = bool(d.get("bottom_kb", False))      # default OFF
     if d.get("running"):
         state["running"] = True
         restore_notes.append(f"▶️ Bot pachho RUNNING ({state['mode'].upper()} mode) - /stop thi band karo.")
@@ -2564,19 +2566,31 @@ async def cmd_newstrategy(update: Update, ctx):
     await update.message.reply_text(CUSTOM_HELP)
 
 
+def kb_markup():
+    """Neeche na buttons: default OFF (hide). /keyboard on karo to j dekhashe."""
+    return bottom_kb() if state.get("bottom_kb") else ReplyKeyboardRemove()
+
+
 async def cmd_keyboard(update: Update, ctx):
     if not authorized(update):
         return
-    if ctx.args and ctx.args[0].lower() == "off":
+    arg = ctx.args[0].lower() if ctx.args else ""
+    if arg == "on":
+        state["bottom_kb"] = True
+        save_state()
+        return await update.message.reply_text("⌨️ Neeche na buttons chalu. Type karvani jaroor nathi 👇", reply_markup=bottom_kb())
+    if arg == "off":
+        state["bottom_kb"] = False
+        save_state()
         return await update.message.reply_text("⌨️ Neeche na buttons band karya.", reply_markup=ReplyKeyboardRemove())
-    await update.message.reply_text("⌨️ Neeche na buttons chalu. Type karvani jaroor nathi 👇", reply_markup=bottom_kb())
+    await update.message.reply_text(f"⌨️ Neeche na buttons: {'ON' if state.get('bottom_kb') else 'OFF (default)'}\n"
+                                    "/keyboard on = chalu\n/keyboard off = band")
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    await update.message.reply_text(f"Your chat id: {update.effective_chat.id}")
-    await update.message.reply_text("⌨️ Neeche na buttons vapro, type karvani jaroor nathi 👇", reply_markup=bottom_kb())
+    await update.message.reply_text(f"Your chat id: {update.effective_chat.id}", reply_markup=kb_markup())
     await update.message.reply_text(main_menu_text(), reply_markup=main_menu_kb())
 
 
@@ -3728,7 +3742,7 @@ async def post_init(app: Application):
         BotCommand("orders", "📒 Angel One aaj na orders"),
         BotCommand("strike", "🎯 Sell strike (ATM / OTM / ITM)"),
         BotCommand("storage", "💾 Saved data / storage"),
-        BotCommand("keyboard", "⌨️ Neeche na buttons (/keyboard off = band)"),
+        BotCommand("keyboard", "⌨️ Neeche na buttons (/keyboard on = chalu)"),
         BotCommand("sync", "📥 Angel orders thi trades bot ma umero"),
         BotCommand("maxtrades", "🔢 Max trades per day"),
         BotCommand("sound", "🔔 Alert sound ON/OFF"),
@@ -3755,8 +3769,8 @@ async def post_init(app: Application):
                         else "\n\nBot STOPPED che. Navi entry mate neeche ▶️ Run dabavo.")
                 msg = "♻️ Bot restart thayo, juno data restore karyo:\n" + "\n".join(restore_notes) + tail
             else:
-                msg = "🟢 Bot online. Neeche na buttons vapro 👇"
-            await app.bot.send_message(ALLOWED_CHAT_ID, msg, reply_markup=bottom_kb())
+                msg = "🟢 Bot online. Menu mate /menu."
+            await app.bot.send_message(ALLOWED_CHAT_ID, msg, reply_markup=kb_markup())
         except Exception as e:
             log.warning("startup message fail: %s", e)
         if state["mode"] == "live":
