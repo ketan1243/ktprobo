@@ -40,6 +40,7 @@ except Exception:   # lib ma na hoy to REST fallback
     SmartWebSocketV2 = None
 from telegram import (BotCommand, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup,
                       MenuButtonCommands, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
@@ -915,6 +916,7 @@ def save_state():
             "dash_msg_id": state["dash_msg_id"], "dash_chat": state["dash_chat"],
             "dash_compact": state["dash_compact"],
             "strategy": state["strategy"],
+            "fallback_chat": state.get("fallback_chat"),
             "blocked_dir": state["blocked_dir"],
             "day_halt": state["day_halt"],
             "limit_override": state["limit_override"],
@@ -1298,6 +1300,7 @@ def load_state():
     state["dash_msg_id"] = d.get("dash_msg_id")
     state["dash_chat"] = d.get("dash_chat")
     state["dash_compact"] = bool(d.get("dash_compact", False))
+    state["fallback_chat"] = d.get("fallback_chat")
     if d.get("running"):
         state["running"] = True
         restore_notes.append(f"▶️ Bot pachho RUNNING ({state['mode'].upper()} mode) - /stop thi band karo.")
@@ -2281,9 +2284,51 @@ async def update_live(app: Application, pnl, s_ltp, h_ltp, force=False):
             state["live_msg_id"] = None   # next vakhte navo message
 
 
+def _chunks(text: str, n: int = 4000):
+    """Telegram 4096 char limit: lamba message ne lines par todine bhaag."""
+    out, cur = [], ""
+    for ln in text.split("\n"):
+        while len(ln) > n:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(ln[:n])
+            ln = ln[n:]
+        if len(cur) + len(ln) + 1 > n and cur:
+            out.append(cur)
+            cur = ln
+        else:
+            cur = f"{cur}\n{ln}" if cur else ln
+    if cur or not out:
+        out.append(cur)
+    return out
+
+
+async def _send_retry(app: Application, chat, text: str, silent: bool = False, tries: int = 3, **kw):
+    """Network timeout / flood limit hoy to fari fari prayatna. Chat not found jevi sthayi error turant raise."""
+    last = None
+    for i in range(tries):
+        try:
+            return await app.bot.send_message(chat, text, disable_notification=silent, **kw)
+        except RetryAfter as e:
+            ra = e.retry_after
+            await asyncio.sleep((ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)) + 0.5)
+            last = e
+        except (TimedOut, NetworkError) as e:
+            last = e
+            await asyncio.sleep(1.5 * (i + 1))
+    raise last
+
+
 async def notify(app: Application, text: str, html_mode: bool = False):
-    if ALLOWED_CHAT_ID:
-        await app.bot.send_message(ALLOWED_CHAT_ID, text, parse_mode="HTML" if html_mode else None)
+    chat = ALLOWED_CHAT_ID or state.get("fallback_chat")
+    if not chat:
+        log.error("notify: koi chat id nathi (TELEGRAM_CHAT_ID set karo athva bot ma /start moklo)")
+        return
+    try:
+        await _send_retry(app, chat, text[:4096], False, parse_mode="HTML" if html_mode else None)
+    except Exception as e:
+        log.warning("notify fail: %s", e)
 
 
 # ----------------------------- MAIN LOOP ------------------------------
@@ -2323,17 +2368,50 @@ def alert_chat(mode: str) -> int:
 
 
 async def notify_trade(app: Application, text: str, mode: str, loud: bool = False):
-    """Entry/exit alert: mode no alag chat (hoy to), sound ON/OFF setting mujab. loud=True -> hamesha sound (error)."""
+    """Entry/exit alert: mode no alag chat (hoy to), sound ON/OFF setting mujab. loud=True -> hamesha sound (error).
+    Retry kare; alert chat fail thay to main chat ma; badhu fail thay to log ma error (chupchap nahi)."""
     silent = not (ALERT_SOUND or loud)
-    chat = alert_chat(mode)
-    if not chat:
+    chats = []
+    for c in (alert_chat(mode), ALLOWED_CHAT_ID, state.get("fallback_chat")):
+        if c and c not in chats:
+            chats.append(c)
+    if not chats:
+        log.error("ALERT NATHI GAYU: TELEGRAM_CHAT_ID set nathi ane koi chat nathi. Bot ma /start moklo.")
         return
+    for chat in chats:
+        try:
+            for i, part in enumerate(_chunks(text)):
+                await _send_retry(app, chat, part, silent or i > 0)      # sound fakt pehla bhaag ma
+            return
+        except Exception as e:
+            log.warning("alert chat %s ma na gayu (%s)%s", chat, e, " -> bijo chat try" if chat != chats[-1] else "")
+    log.error("ALERT badhi chat ma fail thayu: %s", text[:80])
+
+
+async def cmd_testalert(update: Update, ctx):
+    """Trade alert chalse ke nahi te check: alert chat ma sound sathe test message moklse ane error batavse."""
+    if not authorized(update):
+        return
+    mode = state["mode"]
+    chat = alert_chat(mode) or state.get("fallback_chat")
+    here = update.effective_chat.id
+    L = [f"🔔 Alert test ({mode.upper()})",
+         f"Alert chat id: {chat or 'NATHI'}",
+         f"Aa chat j che? {'Haa' if chat == here else 'Na, alag chat/group ma jashe'}",
+         f"Sound setting: {'ON' if ALERT_SOUND else 'OFF (silent) -> /sound on'}"]
+    if not chat:
+        L.append("❌ Chat id nathi. .env ma TELEGRAM_CHAT_ID set karo (id jaanva /chatid).")
+        return await update.message.reply_text("\n".join(L))
     try:
-        await app.bot.send_message(chat, text, disable_notification=silent)
+        await _send_retry(ctx.application, chat, "🔔 TEST ALERT - aa message sound sathe aavvo joiye.", not ALERT_SOUND)
+        L.append("✅ Message moklayo.")
+        if chat != here:
+            L.append("👉 Te alert chat/group ma check karo.")
+        L.append("Sound na aave to: e chat Telegram ma Mute na hoy, ane phone ma Telegram na Notification/Sound permission ON hoy.")
     except Exception as e:
-        log.warning("alert chat %s ma na gayu (%s) -> main chat", chat, e)
-        if ALLOWED_CHAT_ID and chat != ALLOWED_CHAT_ID:
-            await app.bot.send_message(ALLOWED_CHAT_ID, text, disable_notification=silent)
+        L.append(f"❌ Fail: {e}")
+        L.append("Chat id khotu hoy athva bot e group ma add nathi/block che. Group ma bot add karo ane /chatid thi sacho id lyo.")
+    await update.message.reply_text("\n".join(L))
 
 
 async def set_day_halt(app: Application, reason: str):
@@ -2427,7 +2505,10 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------------------- COMMANDS -------------------------------
 def authorized(update: Update) -> bool:
-    return ALLOWED_CHAT_ID == 0 or update.effective_chat.id == ALLOWED_CHAT_ID
+    ok = ALLOWED_CHAT_ID == 0 or update.effective_chat.id == ALLOWED_CHAT_ID
+    if ok and not ALLOWED_CHAT_ID and update.effective_chat:
+        state["fallback_chat"] = update.effective_chat.id     # TELEGRAM_CHAT_ID khali hoy to aa chat ma alert moklo
+    return ok
 
 
 # ----------------------------- BOTTOM BUTTONS (type karvu nahi pade) -----------------
@@ -3653,6 +3734,7 @@ async def post_init(app: Application):
         BotCommand("sound", "🔔 Alert sound ON/OFF"),
         BotCommand("breakout", "🕯 Candle breakout condition ON/OFF"),
         BotCommand("newstrategy", "➕ Navi strategy + condition add"),
+        BotCommand("testalert", "🔔 Trade alert / sound test"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -4421,6 +4503,8 @@ def main():
     load_custom_strategies()      # custom strategy + remove kareli built-in (load_state pehla)
     load_state()
     ensure_valid_strategy()
+    if not ALLOWED_CHAT_ID:
+        log.warning("TELEGRAM_CHAT_ID set nathi! Alert fakt chhelle /start moklnar chat ma jashe, ane bot badha mate khulo che. .env ma set karo.")
     angel_login()
     load_scrips()
     start_ws()
@@ -4435,7 +4519,7 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid), ("breakout", cmd_breakout), ("newstrategy", cmd_newstrategy)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid), ("breakout", cmd_breakout), ("newstrategy", cmd_newstrategy), ("testalert", cmd_testalert)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_bottom_text))
