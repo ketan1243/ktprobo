@@ -1572,10 +1572,10 @@ CUSTOM_HELP = (
     "━━━━━━━━━━━━━━━━━━\n"
     "Niche mujab ek j message ma moklo 👇\n\n"
     "name: RSI Trend\n"
-    "buy: close > ema(20) and rsi(14) > 55\n"
-    "sell: close < ema(20) and rsi(14) < 45\n\n"
-    "• buy = bullish (PE spread sell), sell = bearish (CE spread sell)\n"
-    "• 'sell:' na lakho to buy ni ulti condition aapo-aap banse (RSI no number 100-x thase)\n"
+    "bullish: close > ema(20) and rsi(14) > 55\n"
+    "bearish: close < ema(20) and rsi(14) < 45\n\n"
+    "• bullish = PE spread sell, bearish = CE spread sell\n"
+    "• 'bearish:' na lakho to bullish ni ulti condition aapo-aap banse (RSI no number 100-x thase)\n"
     "• Ek line ma ghani condition 'and' thi jodo (badhi sachi hovi joiye)\n"
     "• Koi condition match na thay to pehlano trend chalu rahe\n"
     "• Candle breakout ON hoy to te pan badhi strategy ma lagu pade\n\n"
@@ -1587,10 +1587,10 @@ CUSTOM_HELP = (
     "Operators: >  <  >=  <=  =\n\n"
     "Example 2:\n"
     "name: ST + EMA\n"
-    "buy: stdir(10,3) = up and ema(9) > ema(21)\n\n"
+    "bullish: stdir(10,3) = up and ema(9) > ema(21)\n\n"
     "Example 3:\n"
     "name: Breakout\n"
-    "buy: close > high[1] and close > sma(20)"
+    "bullish: close > high[1] and close > sma(20)"
 )
 
 
@@ -1761,8 +1761,8 @@ def _custom_signal(spec: dict, df: pd.DataFrame):
                     f"{'✔' if ok else '✘'}")
         except Exception:
             return f"{_cond_text(c)} {'✔' if ok else '✘'}"
-    _sig_cache["extra"] = ("BUY: " + "; ".join(part(c) for c in spec["bull"]) +
-                           " | SELL: " + "; ".join(part(c) for c in spec["bear"]))
+    _sig_cache["extra"] = ("BULLISH: " + "; ".join(part(c) for c in spec["bull"]) +
+                           " | BEARISH: " + "; ".join(part(c) for c in spec["bear"]))
     ref = float(df["close"].iloc[i])
     for c in spec["bull"]:
         for o in (c[0], c[2]):
@@ -1792,17 +1792,17 @@ def parse_strategy_text(txt: str) -> dict:
         ln = raw.strip()
         if not ln:
             continue
-        m = re.match(r"^(name|naam|buy|bull|long|sell|bear|short)\s*[:=]\s*(.+)$", ln, re.I)
+        m = re.match(r"^(name|naam|bullish|bearish|buy|bull|long|sell|bear|short)\s*[:=]\s*(.+)$", ln, re.I)
         if not m:
-            raise ValueError(f"Line samjayi nahi: '{ln}'\nShuruat name: / buy: / sell: thi karo.")
+            raise ValueError(f"Line samjayi nahi: '{ln}'\nShuruat name: / bullish: / bearish: thi karo.")
         k, body = m.group(1).lower(), m.group(2).strip()
         if k in ("name", "naam"):
             name = re.sub(r"\s+", " ", body)[:28]
             continue
         conds = [x for x in re.split(r"\s+(?:and|&&|&)\s+", body, flags=re.I) if x.strip()]
-        (buy if k in ("buy", "bull", "long") else sell).extend(_parse_cond(x) for x in conds)
+        (buy if k in ("bullish", "buy", "bull", "long") else sell).extend(_parse_cond(x) for x in conds)
     if not buy:
-        raise ValueError("Ochhama ochhi ek 'buy:' condition joiye.")
+        raise ValueError("Ochhama ochhi ek 'bullish:' condition joiye.")
     if len(buy) > 6 or len(sell) > 6:
         raise ValueError("Ek side ma max 6 condition.")
     auto = not sell
@@ -1911,8 +1911,8 @@ def restore_builtin_strategies():
 
 def strategy_detail(key: str) -> str:
     v = STRATEGIES[key]
-    return (f"• {v['label']} (custom)\n   BUY: " + " AND ".join(_cond_text(c) for c in v["bull"]) +
-            "\n   SELL: " + " AND ".join(_cond_text(c) for c in v["bear"]))
+    return (f"• {v['label']} (custom)\n   BULLISH: " + " AND ".join(_cond_text(c) for c in v["bull"]) +
+            "\n   BEARISH: " + " AND ".join(_cond_text(c) for c in v["bear"]))
 
 
 def _strategy_signal(strategy: str, df: pd.DataFrame):
@@ -2470,8 +2470,8 @@ async def on_bottom_text(update: Update, ctx):
         note = " (ulti condition aapo-aap)" if spec["auto_mirror"] else ""
         await update.message.reply_text(
             f"✅ Navi strategy save thai: {label}\n"
-            f"BUY (PE spread): " + " AND ".join(_cond_text(c) for c in spec["bull"]) + "\n"
-            f"SELL (CE spread){note}: " + " AND ".join(_cond_text(c) for c in spec["bear"]),
+            f"BULLISH (PE spread): " + " AND ".join(_cond_text(c) for c in spec["bull"]) + "\n"
+            f"BEARISH (CE spread){note}: " + " AND ".join(_cond_text(c) for c in spec["bear"]),
             reply_markup=Markup([[Btn("✅ Aa strategy select karo", callback_data=f"strat_{key}")],
                                  [Btn("🧠 Strategy menu", callback_data="strategy")]]))
 
