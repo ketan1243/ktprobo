@@ -3487,7 +3487,10 @@ async def cmd_backtest(update: Update, ctx):
         return
     import shlex
     args = list(ctx.args or [])
-    if args and args[0].lower() in ("help", "?"):
+    is_help = any("help" in a.lower() or a == "?" for a in args)
+    while args and not args[0].startswith("-"):      # '--' vagar na extra shabdo (jem ke 'report') ignore
+        args.pop(0)
+    if is_help:
         return await update.message.reply_text(
             "📊 Backtest (aaj na bot settings mujab, option sell spread)\n\n"
             "/backtest  → current strategy, 3 min, 365 divas\n"
