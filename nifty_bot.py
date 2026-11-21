@@ -133,7 +133,6 @@ DAY_LIMIT_STEP = 500.0
 MAX_TRADES_ON = False        # divas na max trades nu limit ON/OFF
 MAX_TRADES_PER_DAY = 5        # ON hoy tyare: divas ma max ketla trade. Aatla thay pachhi aakho divas trading band
 ALERT_SOUND = True            # entry/exit Telegram alert sound sathe (False = silent notification)
-CANDLE_BREAKOUT = True        # badhi strategy ma extra condition: close > pichhli candle High (bullish) / close < pichhli candle Low (bearish)
 ONE_TRADE_PER_TREND = True   # profit/loss book thaya pachi same trend ma navi trade nahi (trend flip ni rah)
 HISTORY_DAYS = None          # None = auto (timeframe mujab). Indicator ma aagal na divas na candles ketla divas na levana
 ANGEL_MAX_DAYS = {1: 30, 3: 60, 5: 100, 10: 100, 15: 200, 30: 200}     # Angel One history limit per interval
@@ -985,7 +984,6 @@ def snapshot_settings() -> dict:
             "EXPIRY_MODE": EXPIRY_MODE, "EXPIRY_SKIP_TODAY": EXPIRY_SKIP_TODAY, "CANDLE_MINUTES": CANDLE_MINUTES,
             "DAY_LIMIT_ON": DAY_LIMIT_ON, "DAY_LOSS_LIMIT": DAY_LOSS_LIMIT, "DAY_PROFIT_LIMIT": DAY_PROFIT_LIMIT,
             "MAX_TRADES_ON": MAX_TRADES_ON, "MAX_TRADES_PER_DAY": MAX_TRADES_PER_DAY, "ALERT_SOUND": ALERT_SOUND,
-            "CANDLE_BREAKOUT": CANDLE_BREAKOUT,
             "strategy": state["strategy"]}
 
 
@@ -993,9 +991,8 @@ def apply_settings(st: dict):
     """Setting dict ne globals ma lagu kare (mode badalta / file load thata)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
     global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
-    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET, MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND, CANDLE_BREAKOUT
+    global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET, MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
     st = st or {}
-    CANDLE_BREAKOUT = bool(st.get("CANDLE_BREAKOUT", CANDLE_BREAKOUT))
     _mt = int(st.get("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY))
     MAX_TRADES_PER_DAY = max(1, min(100, _mt)) if _mt > 0 else MAX_TRADES_PER_DAY
     # juni file ma ON/OFF nahotu: count > 0 hoy to ON gano
@@ -1079,7 +1076,7 @@ def _do_action(d: str, inactive: bool):
     """Setting button no sync action. Return (toast, alert)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND
     global HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY, DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
-    global MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND, CANDLE_BREAKOUT
+    global MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
     if d.startswith("set_"):
         _, key, val = d.split("_", 2)
         v = int(val)
@@ -1123,10 +1120,6 @@ def _do_action(d: str, inactive: bool):
                 state["day_halt"] = None                       # limit vadhari/OFF karyu to trading pacho chalu
         elif key == "snd":
             ALERT_SOUND = not ALERT_SOUND
-        elif key == "cbo":
-            CANDLE_BREAKOUT = not CANDLE_BREAKOUT
-            if not inactive:
-                _sig_cache["val"], _sig_cache["bucket"] = None, None      # signal pharithi gano
         elif key == "dres":
             if inactive:
                 return "Aa mode chalu nathi", True
@@ -1489,6 +1482,8 @@ def supertrend(df: pd.DataFrame, period=ST_PERIOD, mult=ST_MULT) -> pd.DataFrame
     fub, flb = ub.copy(), lb.copy()
     close = c.values
     direction = [1] * len(df)   # 1 = green (uptrend), -1 = red
+    if len(df):                 # aaj na data thi shuruat: pehli candle green/red mujab
+        direction[0] = 1 if close[0] >= df["open"].iloc[0] else -1
     for i in range(1, len(df)):
         fub[i] = ub[i] if (ub[i] < fub[i - 1] or close[i - 1] > fub[i - 1]) else fub[i - 1]
         flb[i] = lb[i] if (lb[i] > flb[i - 1] or close[i - 1] < flb[i - 1]) else flb[i - 1]
@@ -1546,13 +1541,17 @@ def rsi_wma_calc(df: pd.DataFrame):
     """RSI(9) (Wilder), RSI nu WMA(21), close nu SMA(5) ane carry-forward direction list."""
     c = df["close"]
     delta = c.diff()
-    avg_up = delta.clip(lower=0).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-    avg_dn = (-delta.clip(upper=0)).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    if len(df):
+        delta.iloc[0] = c.iloc[0] - df["open"].iloc[0]          # divas ni pehli candle: divas na open thi move
+    avg_up = delta.clip(lower=0).ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()   # RSI ne RSI_PERIOD candle joiye
+    avg_dn = (-delta.clip(upper=0)).ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()
     rsi = 100 - 100 / (1 + avg_up / avg_dn)
     rsi = rsi.mask(avg_dn == 0, 100.0).mask((avg_dn == 0) & (avg_up == 0), 50.0)
     w = np.arange(1, RSI_WMA_LEN + 1)
-    wma = rsi.rolling(RSI_WMA_LEN).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
-    sma = c.rolling(SMA_LEN).mean()
+    rv = rsi.dropna()
+    wma = rv.rolling(RSI_WMA_LEN, min_periods=1).apply(           # aaj na thoda candle hoy to teTla par j
+        lambda x: np.dot(x, np.arange(1, len(x) + 1)) / (len(x) * (len(x) + 1) / 2), raw=True).reindex(rsi.index)
+    sma = c.rolling(SMA_LEN, min_periods=1).mean()
     bull = ((rsi > wma) & (c > sma)).values      # RSI > WMA  AND  close > SMA5
     bear = ((rsi < wma) & (c < sma)).values      # RSI < WMA  AND  close < SMA5
     dirs, cur = [], 0
@@ -1570,7 +1569,7 @@ CUSTOM_FILE = os.path.join(DATA_DIR, "custom_strategies.json")   # tamari banave
 _PRICE_NAMES = {"close", "open", "high", "low"}
 _FUNCS = {"ema": 1, "sma": 1, "wma": 1, "rsi": 1, "rsiwma": 2, "macd": 2, "macdsig": 3, "st": 2, "stdir": 2}
 _OP_RE = re.compile(r"^(.+?)(>=|<=|==|=|>|<)(.+)$")
-_OPND_RE = re.compile(r"^([a-z]+)(?:\(([\d.,]+)\))?(?:\[(\d+)\])?$")
+_OPND_RE = re.compile(r"^([a-z]+)(?:\(([\d.,]+)\))?(?:\[(-?\d+|prev|previous|next)\])?$")
 _MIRROR_OP = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "=": "="}
 CUSTOM_HELP = (
     "➕ Navi strategy banavo\n"
@@ -1582,10 +1581,12 @@ CUSTOM_HELP = (
     "• bullish = PE spread sell, bearish = CE spread sell\n"
     "• 'bearish:' na lakho to bullish ni ulti condition aapo-aap banse (RSI no number 100-x thase)\n"
     "• Ek line ma ghani condition 'and' thi jodo (badhi sachi hovi joiye)\n"
-    "• Koi condition match na thay to pehlano trend chalu rahe\n"
-    "• Candle breakout ON hoy to te pan badhi strategy ma lagu pade\n\n"
+    "• Koi condition match na thay to pehlano trend chalu rahe\n\n"
     "Vapari shakay tevu:\n"
-    "close, open, high, low  (pachhli candle: high[1], low[1])\n"
+    "close, open, high, low\n"
+    "• Previous candle (minus): high[-1]  low[-1]  close[-1]  (2 candle pehla: [-2])\n"
+    "• Next candle (plus): high[1]  low[1]  close[1]  (2 candle aagal: [2])\n"
+    "  ⚠️ Next candle band thay pachhi j signal aave (1 candle moDu), kem ke next candle pehla khabar na hoy\n"
     "ema(n)  sma(n)  wma(n)  rsi(n)  rsiwma(n,m)\n"
     "macd(fast,slow)  macdsig(fast,slow,sig)\n"
     "st(period,mult) = supertrend line,  stdir(period,mult) = up / down\n"
@@ -1595,7 +1596,10 @@ CUSTOM_HELP = (
     "bullish: stdir(10,3) = up and ema(9) > ema(21)\n\n"
     "Example 3:\n"
     "name: Breakout\n"
-    "bullish: close > high[1] and close > sma(20)"
+    "bullish: close > high[-1] and close > sma(20)\n\n"
+    "Example 4 (next candle confirm):\n"
+    "name: Next Confirm\n"
+    "bullish: close > sma(20) and close[1] > high"
 )
 
 
@@ -1612,11 +1616,14 @@ def _parse_operand(t: str):
     m = _OPND_RE.match(t)
     if not m:
         raise ValueError(f"'{t}' samjayu nahi")
-    name, args, shift = m.group(1), m.group(2), int(m.group(3) or 0)
-    if shift > 50:
-        raise ValueError("Shift [k] max 50")
+    name, args, sh = m.group(1), m.group(2), m.group(3)
+    shift = 0 if sh is None else {"prev": 1, "previous": 1, "next": -1}.get(sh)
+    if sh is not None and shift is None:
+        shift = -int(sh)                                # tame: [-k] = previous candle, [k] = next candle
+    if shift > 50 or shift < -5:
+        raise ValueError("Previous candle max [-50] (jem ke high[-2]), next candle max [5] (jem ke high[1])")
     if name in _PRICE_NAMES and args is None:
-        return ("price", name, shift, f"{name}[{shift}]" if shift else name)
+        return ("price", name, shift, f"{name}[{-shift}]" if shift else name)
     if name in _FUNCS:
         if args is None:
             raise ValueError(f"{name}(...) ma number joiye")
@@ -1634,7 +1641,7 @@ def _parse_operand(t: str):
             if any(x < 1 or x > 200 or x != int(x) for x in a):
                 raise ValueError(f"{name}() na number 1 thi 200 ni vachhe (purna sankhya) joiye")
             a = [int(x) for x in a]
-        txt = f"{name}({','.join(f'{x:g}' for x in a)})" + (f"[{shift}]" if shift else "")
+        txt = f"{name}({','.join(f'{x:g}' for x in a)})" + (f"[{-shift}]" if shift else "")
         return ("fn", name, a, shift, txt)
     raise ValueError(f"'{name}' indicator ni ovkhato nathi")
 
@@ -1670,21 +1677,25 @@ def _mirror_cond(c):
             rhs = ("num", -rhs[1])
     if lhs[0] == "price" and lhs[1] == "close" and rhs[0] == "price" and rhs[1] in ("high", "low"):
         rhs = ("price", "low" if rhs[1] == "high" else "high", rhs[2],
-               ("low" if rhs[1] == "high" else "high") + (f"[{rhs[2]}]" if rhs[2] else ""))   # breakout: high[1] <-> low[1]
+               ("low" if rhs[1] == "high" else "high") + (f"[{-rhs[2]}]" if rhs[2] else ""))   # breakout: high[1] <-> low[1]
     return (lhs, _MIRROR_OP[op], rhs)
 
 
-def _rsi_series(c: pd.Series, n: int) -> pd.Series:
+def _rsi_series(c: pd.Series, n: int, first_open=None) -> pd.Series:
     delta = c.diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    dn = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    if first_open is not None and len(c):
+        delta.iloc[0] = c.iloc[0] - first_open          # divas ni pehli candle: divas na open thi move
+    up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()      # RSI ne n candle joiye (pehla NaN)
+    dn = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     r = 100 - 100 / (1 + up / dn)
     return r.mask(dn == 0, 100.0).mask((dn == 0) & (up == 0), 50.0)
 
 
 def _wma_series(s_: pd.Series, n: int) -> pd.Series:
-    w = np.arange(1, n + 1)
-    return s_.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
+    v = s_.dropna()                                              # aaj na thoda candle hoy to teTla par j (partial window)
+    w = v.rolling(n, min_periods=1).apply(
+        lambda x: np.dot(x, np.arange(1, len(x) + 1)) / (len(x) * (len(x) + 1) / 2), raw=True)
+    return w.reindex(s_.index)
 
 
 def _op_series(o, df: pd.DataFrame, cache: dict) -> pd.Series:
@@ -1701,13 +1712,13 @@ def _op_series(o, df: pd.DataFrame, cache: dict) -> pd.Series:
         if name == "ema":
             ser = c.ewm(span=a[0], adjust=False).mean()
         elif name == "sma":
-            ser = c.rolling(a[0]).mean()
+            ser = c.rolling(a[0], min_periods=1).mean()
         elif name == "wma":
             ser = _wma_series(c, a[0])
         elif name == "rsi":
-            ser = _rsi_series(c, a[0])
+            ser = _rsi_series(c, a[0], df["open"].iloc[0])
         elif name == "rsiwma":
-            ser = _wma_series(_rsi_series(c, a[0]), a[1])
+            ser = _wma_series(_rsi_series(c, a[0], df["open"].iloc[0]), a[1])
         elif name == "macd":
             ser = c.ewm(span=a[0], adjust=False).mean() - c.ewm(span=a[1], adjust=False).mean()
         elif name == "macdsig":
@@ -1740,6 +1751,13 @@ def _cond_series(c, df, cache) -> pd.Series:
 
 def _custom_signal(spec: dict, df: pd.DataFrame):
     """spec = STRATEGIES[key]. Return (direction, candle_time, reference_line)."""
+    kmax = 0                                            # ketla candle AAGAL (next candle) nu vaparyu che
+    for c in spec["bull"] + spec["bear"]:
+        for o in (c[0], c[2]):
+            if o[0] in ("price", "fn"):
+                kmax = max(kmax, -(o[2] if o[0] == "price" else o[3]))
+    if kmax:                                            # adhuri (chalu) candle nahi, fakt BAND thayela candle
+        df = df.iloc[:-1].reset_index(drop=True)
     cache = {}
     bull = pd.Series(True, index=df.index)
     for c in spec["bull"]:
@@ -1754,7 +1772,10 @@ def _custom_signal(spec: dict, df: pd.DataFrame):
         elif r_ and not b_:
             cur = -1
         dirs.append(cur)
-    i = -2                                              # last COMPLETED candle
+    i = -1 if kmax else -2                              # last COMPLETED candle
+
+    def _fmt(v):
+        return "…" if v != v else f"{v:,.1f}"             # next candle haju aavi nathi -> …
 
     def val(o):
         return float(_op_series(o, df, cache).iloc[i])
@@ -1762,7 +1783,7 @@ def _custom_signal(spec: dict, df: pd.DataFrame):
     def part(c):
         ok = bool(_cond_series(c, df, cache).iloc[i])
         try:
-            return (f"{_op_text(c[0])} {val(c[0]):,.1f} {c[1]} {_op_text(c[2])} {val(c[2]):,.1f} "
+            return (f"{_op_text(c[0])} {_fmt(val(c[0]))} {c[1]} {_op_text(c[2])} {_fmt(val(c[2]))} "
                     f"{'✔' if ok else '✘'}")
         except Exception:
             return f"{_cond_text(c)} {'✔' if ok else '✘'}"
@@ -1835,7 +1856,7 @@ def save_custom_strategies():
         data = {"custom": {k: {"label": v["label"], "bull": [_cond_text(c) for c in v["bull"]],
                                "bear": [_cond_text(c) for c in v["bear"]]}
                            for k, v in STRATEGIES.items() if v.get("custom")},
-                "removed": [k for k in _BUILTIN_STRATEGIES if k not in STRATEGIES]}
+                "removed": [k for k in _BUILTIN_STRATEGIES if k not in STRATEGIES], "v": 2}
         tmp = CUSTOM_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=1, ensure_ascii=False)
@@ -1859,15 +1880,21 @@ def load_custom_strategies():
     except Exception as e:
         log.warning("custom strategies vachay nahi: %s", e)
         return
+    legacy = data.get("v") != 2                          # juni file: [1] = previous hatu -> have [-1]
+
+    def _fix(t):
+        return re.sub(r"\[(-?\d+)\]", lambda m_: f"[{-int(m_.group(1))}]", t) if legacy else t
     for k, v in (data.get("custom") or {}).items():
         try:
-            _register_custom(k, v["label"], [_parse_cond(x) for x in v["bull"]],
-                             [_parse_cond(x) for x in v["bear"]])
+            _register_custom(k, v["label"], [_parse_cond(_fix(x)) for x in v["bull"]],
+                             [_parse_cond(_fix(x)) for x in v["bear"]])
         except Exception as e:
             log.warning("custom strategy %s skip: %s", k, e)
     for k in data.get("removed") or []:
         if k in STRATEGIES and not STRATEGIES[k].get("custom") and len(STRATEGIES) > 1:
             STRATEGIES.pop(k, None)
+    if legacy:
+        save_custom_strategies()
     ensure_valid_strategy()
 
 
@@ -1929,7 +1956,8 @@ def _strategy_signal(strategy: str, df: pd.DataFrame):
     if strategy == "ema":
         fast = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
         slow = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-        d = 1 if fast.iloc[-2] > slow.iloc[-2] else -1
+        f_, s_ = fast.iloc[-2], slow.iloc[-2]
+        d = 1 if f_ > s_ else (-1 if f_ < s_ else 0)       # pehli candle ma barabar -> neutral
         return d, df["time"].iloc[-2], float(slow.iloc[-2])
     if strategy == "rsi_wma":
         c = df["close"]
@@ -1946,19 +1974,18 @@ def _strategy_signal(strategy: str, df: pd.DataFrame):
 
 
 def compute_signal(strategy: str, df: pd.DataFrame):
-    """Strategy signal + (ON hoy to) candle breakout condition:
-    bullish: chhelli band candle no close > tena pehlani candle no High
-    bearish: chhelli band candle no close < tena pehlani candle no Low
-    Condition na male to signal neutral (0) = navi entry/flip nahi; strategy trend ave to pachhi ni candle ma male to j entry."""
-    d, ct, ref = _strategy_signal(strategy, df)
-    if not CANDLE_BREAKOUT or d == 0 or len(df) < 4:
-        return d, ct, ref
-    c, prev_h, prev_l = float(df["close"].iloc[-2]), float(df["high"].iloc[-3]), float(df["low"].iloc[-3])
-    ok = (c > prev_h) if d == 1 else (c < prev_l)
-    note = (f"Breakout: close {c:,.1f} {'>' if d == 1 else '<'} prev {'High' if d == 1 else 'Low'} "
-            f"{prev_h if d == 1 else prev_l:,.1f} {'OK' if ok else 'pending'}")
-    _sig_cache["extra"] = (_sig_cache["extra"] + " | " if _sig_cache.get("extra") else "") + note
-    return (d if ok else 0), ct, ref
+    """Strategy signal (last COMPLETED candle). Koi extra filter nathi: strategy ni potani condition j final."""
+    return _strategy_signal(strategy, df)
+
+
+def today_df(df: pd.DataFrame) -> pd.DataFrame:
+    """FAKT aaj na divas na candles (kal no data/trend gane nahi). Chhelli row adhuri (forming) na hoy to dummy row umere,
+    jethi iloc[-2] hamesha chhelli BAND candle rahe."""
+    now = datetime.now()
+    d = df[df["time"].dt.date == now.date()].reset_index(drop=True)
+    if len(d) and d["time"].iloc[-1] + timedelta(minutes=CANDLE_MINUTES) <= pd.Timestamp(now):
+        d = pd.concat([d, d.tail(1)], ignore_index=True)
+    return d
 
 
 def current_signal():
@@ -1973,7 +2000,11 @@ def current_signal():
         return _sig_cache["val"]
     df_ = get_candles()
     _candle_cache["df"] = df_            # image chart mate
-    val = compute_signal(state["strategy"], df_)
+    day_ = today_df(df_)                 # signal fakt aaj na candles thi (roj navi shuruat)
+    if len(day_) < 2:                    # aaj nu pehlu candle haju band nathi thayu
+        val = (0, pd.Timestamp(open_t), 0.0)
+    else:
+        val = compute_signal(state["strategy"], day_)
     if bucket[2] >= 1:
         # haju navi bandh thayeli candle Angel ma nathi aavi? to cache na karo, next tick ma fari fetch (max 8 vaar)
         expected = pd.Timestamp(open_t + timedelta(minutes=CANDLE_MINUTES * (bucket[2] - 1)))
@@ -2452,6 +2483,7 @@ def roll_day():
         state["blocked_dir"] = None          # navo divas -> trend block reset
         state["day_halt"] = None             # navo divas -> limit halt reset
         state["limit_override"] = False
+        _sig_cache["val"], _sig_cache["bucket"] = None, None      # kal no signal/trend aaj ma na chale
 
 
 async def tick(context: ContextTypes.DEFAULT_TYPE):
@@ -2913,7 +2945,6 @@ def settings_text(prof=None) -> str:
             f"Signal flip exit: {'ON' if EXIT_ON_FLIP else 'OFF'}\n"
             f"{day_limit_text()}\n"
             f"🔢 Max trades/day: {('ON (' + str(MAX_TRADES_PER_DAY) + ')') if MAX_TRADES_ON else 'OFF'}\n"
-            f"🕯 Candle breakout: {'ON (close > pichhli High / < pichhli Low)' if CANDLE_BREAKOUT else 'OFF'}\n"
             f"🔔 Alert sound: {'ON' if ALERT_SOUND else 'OFF (silent)'} • chat: "
             f"{'alag' if alert_chat(prof) != ALLOWED_CHAT_ID else 'main'}\n"
             f"🕒 Time: {ENTRY_START:%H:%M} - {LAST_ENTRY:%H:%M} (exit {FORCE_EXIT:%H:%M}) • "
@@ -2951,7 +2982,6 @@ def settings_kb(prof=None) -> Markup:
         [Btn(f"🔢 Max trades/day: {'ON' if MAX_TRADES_ON else 'OFF'} 🔄", callback_data="set_mton_0")],
         *([[Btn("➖", callback_data="set_mtd_-1"), Btn(f"Trades: {MAX_TRADES_PER_DAY}", callback_data="noop"),
             Btn("➕", callback_data="set_mtd_1")]] if MAX_TRADES_ON else []),
-        [Btn(f"🕯 Candle breakout: {'ON' if CANDLE_BREAKOUT else 'OFF'} 🔄", callback_data="set_cbo_0")],
         [Btn(f"🔔 Alert sound: {'ON' if ALERT_SOUND else 'OFF'} 🔄", callback_data="set_snd_0")],
         *dl_rows,
         [Btn(f"📋 {'LIVE' if prof == 'paper' else 'PAPER'} ni setting ahi copy karo", callback_data="set_copy_0")],
@@ -3637,19 +3667,6 @@ async def cmd_maxtrades(update: Update, ctx):
     await update.message.reply_text("✅ Max trades/day: " + (f"ON ({MAX_TRADES_PER_DAY})" if MAX_TRADES_ON else "OFF"))
 
 
-async def cmd_breakout(update: Update, ctx):
-    global CANDLE_BREAKOUT
-    if not authorized(update):
-        return
-    if ctx.args and ctx.args[0].lower() in ("on", "off"):
-        CANDLE_BREAKOUT = ctx.args[0].lower() == "on"
-        _sig_cache["val"], _sig_cache["bucket"] = None, None
-        save_state()
-    await update.message.reply_text(
-        f"🕯 Candle breakout ({state['mode'].upper()}): {'ON' if CANDLE_BREAKOUT else 'OFF'}\n"
-        "Bullish: close > pichhli candle High\nBearish: close < pichhli candle Low\n/breakout on | /breakout off")
-
-
 async def cmd_sound(update: Update, ctx):
     global ALERT_SOUND
     if not authorized(update):
@@ -3762,7 +3779,6 @@ async def post_init(app: Application):
         BotCommand("sync", "📥 Angel orders thi trades bot ma umero"),
         BotCommand("maxtrades", "🔢 Max trades per day"),
         BotCommand("sound", "🔔 Alert sound ON/OFF"),
-        BotCommand("breakout", "🕯 Candle breakout condition ON/OFF"),
         BotCommand("newstrategy", "➕ Navi strategy + condition add"),
         BotCommand("testalert", "🔔 Alert / sound test (/testalert 10 = 10 sec pachhi)"),
         BotCommand("history", "🗂 History + summary + CSV"),
@@ -4549,7 +4565,7 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid), ("breakout", cmd_breakout), ("newstrategy", cmd_newstrategy), ("testalert", cmd_testalert)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid), ("newstrategy", cmd_newstrategy), ("testalert", cmd_testalert)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_bottom_text))
