@@ -249,7 +249,7 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
     def max_trades_hit():
         return cfg["max_trades_on"] and S_["closed"] >= cfg["max_trades"]
 
-    def open_pos(direction, t, S, bar):
+    def open_pos(direction, t, S, bar, etype="", sig_at=None):
         if S_["halt"]:
             return
         if max_trades_hit():
@@ -273,7 +273,7 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
         if best is None or sp - best[1] <= 0:
             return
         credit = sp - best[1]
-        S_["pos"] = {"dir": direction, "typ": typ, "K": K, "Kh": best[0], "sp": sp, "hp": best[1],
+        S_["pos"] = {"etype": etype, "sig_at": sig_at, "dir": direction, "typ": typ, "K": K, "Kh": best[0], "sp": sp, "hp": best[1],
                      "credit": credit, "t_in": t, "bar": bar, "S_in": S,
                      "sl": -nb.calc_limit(cfg["sl_mode"], cfg["sl_val"], credit, qty),
                      "tp": nb.calc_limit(cfg["tp_mode"], cfg["tp_val"], credit, qty)}
@@ -283,7 +283,8 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
         out.append({"date": str(day), "weekday": day.strftime("%a"), "entry_time": p["t_in"].strftime("%H:%M"),
                     "exit_time": t.strftime("%H:%M"),
                     "duration_min": round((t - p["t_in"]).total_seconds() / 60, 1),
-                    "strategy": strat, "tf": tf, "type": p["typ"], "expiry": str(exp_dt.date()),
+                    "strategy": strat, "tf": tf, "trade_no": S_["closed"] + 1, "trend": "UP" if p["dir"] == 1 else "DOWN", "entry_type": p["etype"],
+                    "signal_at": p["sig_at"].strftime("%H:%M") if p["sig_at"] else "", "type": p["typ"], "expiry": str(exp_dt.date()),
                     "sell_strike": p["K"], "hedge_strike": p["Kh"], "entry_spot": round(p["S_in"], 1),
                     "exit_spot": round(S_exit, 1), "sell_entry": round(p["sp"], 2), "hedge_entry": round(p["hp"], 2),
                     "credit_pts": round(p["credit"], 2), "gross_pnl": round(pnl, 2), "costs": round(costs, 2),
@@ -302,7 +303,7 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
         seg_s = max(st[i], p["t_in"])
         if seg_s >= force:
             S = spot_at(i, seg_s)
-            return close(p, seg_s, mark(p, S, seg_s), "Time exit", S)
+            return close(p, seg_s, mark(p, S, seg_s), "Time exit (trade end)", S)
         seg_e = min(en[i], force)
         sl_l, sl_r, tp_l, tp_r = p["sl"], "STOP LOSS", p["tp"], "TARGET"
         if cfg["day_limit_on"]:
@@ -334,7 +335,7 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
             return close(p, tm, tp_l, tp_r, fav)
         if force <= en[i]:
             S = spot_at(i, force)
-            return close(p, force, mark(p, S, force), "Time exit", S)
+            return close(p, force, mark(p, S, force), "Time exit (trade end)", S)
 
     for i in range(n):
         d_prev = dir_at(i - 1) if i >= 1 else 0
@@ -344,7 +345,8 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
             t_in = max(st[i], entry_start)
             blocked = cfg["one_trade"] and S_["blocked"] == d_prev
             if not blocked and t_in < en[i] and t_in <= last_entry:
-                open_pos(d_prev, t_in, spot_at(i, t_in), i)
+                open_pos(d_prev, t_in, spot_at(i, t_in), i,
+                         "Day start trend" if S_["closed"] == 0 else "Re-entry (new signal)", en[i - 1])
         if S_["pos"] is not None:
             manage(i)
         if S_["pos"] is not None and cfg["exit_on_flip"]:           # candle i band thaya pachi flip check
@@ -353,7 +355,7 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
             if d_now != 0 and d_now != p["dir"]:
                 close(p, en[i], mark(p, C[i], en[i]), "Signal flip", C[i])
                 if en[i] <= last_entry and i + 1 < n:
-                    open_pos(d_now, en[i], C[i], i + 1)
+                    open_pos(d_now, en[i], C[i], i + 1, "Signal flip (reverse)", en[i])
         if S_["pos"] is None and (S_["halt"] or st[i] >= last_entry) and i >= 1:
             break
     if S_["pos"] is not None:                                       # data vahelo puro thayo
@@ -384,7 +386,8 @@ def sim_day_spot(day, g, strat, tf, cfg):
         out.append({"date": str(day), "weekday": day.strftime("%a"), "entry_time": p["t_in"].strftime("%H:%M"),
                     "exit_time": t.strftime("%H:%M"),
                     "duration_min": round((t - p["t_in"]).total_seconds() / 60, 1), "strategy": strat, "tf": tf,
-                    "type": "UP" if p["dir"] == 1 else "DOWN", "entry_spot": round(p["S_in"], 1),
+                    "trade_no": S_["closed"] + 1, "trend": "UP" if p["dir"] == 1 else "DOWN", "entry_type": p["etype"],
+                    "signal_at": p["sig_at"].strftime("%H:%M") if p["sig_at"] else "", "type": "UP" if p["dir"] == 1 else "DOWN", "entry_spot": round(p["S_in"], 1),
                     "exit_spot": round(Sx, 1), "gross_pnl": round(pts, 2), "costs": 0.0,
                     "net_pnl": round(pts, 2), "net_pts": round(pts, 2), "reason": reason})
         S_["closed"] += 1
@@ -393,20 +396,20 @@ def sim_day_spot(day, g, strat, tf, cfg):
         if cfg["max_trades_on"] and S_["closed"] >= cfg["max_trades"]:
             S_["halt"] = True
 
-    def open_pos(direction, t, S, bar):
+    def open_pos(direction, t, S, bar, etype="", sig_at=None):
         if S_["halt"]:
             return
         if cfg["max_trades_on"] and S_["closed"] >= cfg["max_trades"]:
             S_["halt"] = True
             return
-        S_["pos"] = {"dir": direction, "S_in": S, "t_in": t, "bar": bar}
+        S_["pos"] = {"etype": etype, "sig_at": sig_at, "dir": direction, "S_in": S, "t_in": t, "bar": bar}
 
     def manage(i):
         p = S_["pos"]
         seg_s = max(st[i], p["t_in"])
         if seg_s >= force:
             S = spot_at(i, seg_s)
-            return close(p, seg_s, (S - p["S_in"]) * p["dir"], "Time exit", S)
+            return close(p, seg_s, (S - p["S_in"]) * p["dir"], "Time exit (trade end)", S)
         seg_e = min(en[i], force)
         if sl or tp:
             if p["bar"] < i:
@@ -428,7 +431,7 @@ def sim_day_spot(day, g, strat, tf, cfg):
                 return close(p, tm, tp, "TARGET", fav)
         if force <= en[i]:
             S = spot_at(i, force)
-            return close(p, force, (S - p["S_in"]) * p["dir"], "Time exit", S)
+            return close(p, force, (S - p["S_in"]) * p["dir"], "Time exit (trade end)", S)
 
     for i in range(n):
         d_prev = dir_at(i - 1) if i >= 1 else 0
@@ -437,7 +440,8 @@ def sim_day_spot(day, g, strat, tf, cfg):
         if S_["pos"] is None and not S_["halt"] and d_prev != 0 and i >= 1:
             t_in = max(st[i], entry_start)
             if not (cfg["one_trade"] and S_["blocked"] == d_prev) and t_in < en[i] and t_in <= last_entry:
-                open_pos(d_prev, t_in, spot_at(i, t_in), i)
+                open_pos(d_prev, t_in, spot_at(i, t_in), i,
+                         "Day start trend" if S_["closed"] == 0 else "Re-entry (new signal)", en[i - 1])
         if S_["pos"] is not None:
             manage(i)
         if S_["pos"] is not None and cfg["exit_on_flip"]:
@@ -446,7 +450,7 @@ def sim_day_spot(day, g, strat, tf, cfg):
             if d_now != 0 and d_now != p["dir"]:
                 close(p, en[i], (C[i] - p["S_in"]) * p["dir"], "Signal flip", C[i])
                 if en[i] <= last_entry and i + 1 < n:
-                    open_pos(d_now, en[i], C[i], i + 1)
+                    open_pos(d_now, en[i], C[i], i + 1, "Signal flip (reverse)", en[i])
         if S_["pos"] is None and (S_["halt"] or st[i] >= last_entry) and i >= 1:
             break
     if S_["pos"] is not None:
@@ -504,11 +508,11 @@ def cls(x):
     return "pos" if x > 0 else ("neg" if x < 0 else "")
 
 
-def table(headers, rows):
+def table(headers, rows, tall=False):
     h = "".join(f"<th>{html.escape(str(x))}</th>" for x in headers)
     b = "".join("<tr>" + "".join(f"<td{(' class=%s' % c) if c else ''}>{html.escape(str(v))}</td>"
                                  for v, c in r) + "</tr>" for r in rows)
-    return f"<div class='sc'><table><tr>{h}</tr>{b}</table></div>"
+    return f"<div class='sc{' tall' if tall else ''}'><table><tr>{h}</tr>{b}</table></div>"
 
 
 def metric_row(label, m):
@@ -537,23 +541,85 @@ def equity_svg(t, w=760, h=170):
             f"<polyline fill='none' stroke='var(--acc)' stroke-width='1.8' points='{pts}'/></svg>")
 
 
-def combo_section(key, t, last_day, first_day):
+def trade_log_rows(t):
+    rows = []
+    for _, r in t.iterrows():
+        what = (f"{r['type']} {int(r['sell_strike'])}/{int(r['hedge_strike'])}" if "sell_strike" in t.columns
+                else ("Long" if r["trend"] == "UP" else "Short"))
+        cr = [(f"{r['credit_pts']:.1f}", "")] if "credit_pts" in t.columns else []
+        rows.append([(r["date"][5:], ""), (r["weekday"], ""), (int(r["trade_no"]), ""), (r["signal_at"], ""),
+                     (r["entry_time"], ""), (r["exit_time"], ""), (f"{r['duration_min']:.0f}", ""),
+                     ("UP ▲" if r["trend"] == "UP" else "DOWN ▼", ""), (r["entry_type"], ""), (what, ""),
+                     (f"{r['entry_spot']:.0f} → {r['exit_spot']:.0f}", "")] + cr +
+                    [(inr(r["net_pnl"]), cls(r["net_pnl"])), (r["reason"], "")])
+    return rows
+
+
+def day_groups(t, days_list):
+    by = {d: g for d, g in t.groupby("date")} if len(t) else {}
+    out = []
+    for d in days_list:
+        g = by.get(d)
+        wd = pd.Timestamp(d).strftime("%a")
+        out.append((f"{d} {wd}", g if g is not None else t.iloc[0:0]))
+    return out
+
+
+def compact_table(first_hdr, groups):
+    cum, rows = 0.0, []
+    for label, g in groups:
+        n = len(g)
+        if n:
+            p = g["net_pnl"]
+            w = int((p > 0).sum())
+            net, pts = p.sum(), g["net_pts"].sum()
+            cum += net
+            rows.append([(label, ""), (n, ""), (w, ""), (n - w, ""), (f"{100.0 * w / n:.0f}%", ""),
+                         (inr(net), cls(net)), (f"{pts:+.0f}", cls(pts)), (inr(cum), cls(cum))])
+        else:
+            rows.append([(label, ""), (0, ""), ("-", ""), ("-", ""), ("-", ""), ("no trade", ""), ("-", ""),
+                         (inr(cum), cls(cum))])
+    return table([first_hdr, "Trades", "Wins", "Losses", "Win %", "Net P&L", "Net pts", "Cumulative"], rows, tall=True)
+
+
+def combo_section(key, t, last_day, first_day, days_list, detail_days=7):
     strat, tf = key
     label = nb.STRATEGIES.get(strat, {}).get("label", strat)
     span = (last_day - first_day).days
     s = [f"<h2>{html.escape(label)} • {tf} min</h2>"]
     rows = [metric_row(nm, metrics(period_slice(t, last_day, d))) for nm, d in PERIODS if d is None or d <= span + 3]
     s.append("<h3>Period-wise</h3>" + table(MH, rows))
-    s.append("<h3>Equity curve (net, trade by trade)</h3>" + equity_svg(t))
+
+    lo = str(last_day - timedelta(days=detail_days - 1))
+    lw = t[t["date"] >= lo] if len(t) else t
+    s.append(f"<h3>Last {detail_days} days – darek trade ni entry / exit details ({lo} → {last_day})</h3>")
+    if len(lw):
+        hdr = ["Date", "Day", "#", "Signal@", "Entry", "Exit", "Min", "Trend", "Entry type", "Trade", "Nifty in → out"]
+        hdr += ["Credit"] if "credit_pts" in t.columns else []
+        hdr += ["P&L", "Exit reason"]
+        rws = trade_log_rows(lw)
+        tot = lw["net_pnl"].sum()
+        rws.append([("Total", ""), ("", ""), (len(lw), "")] + [("", "")] * (len(hdr) - 5) +
+                   [(inr(tot), cls(tot)), ("", "")])
+        s.append(table(hdr, rws))
+    else:
+        s.append("<p class='note'>Aa period ma koi trade nathi.</p>")
+
+    dl = [d for d in days_list if str(first_day) <= d <= str(last_day)]
+    s.append("<h3>Day-wise</h3>" + compact_table("Date", day_groups(t, dl)))
     if len(t):
         t = t.copy()
+        mon = pd.to_datetime(t["date"]) - pd.to_timedelta(pd.to_datetime(t["date"]).dt.weekday, unit="D")
+        t["week"] = mon.dt.strftime("%Y-%m-%d")
+        wrows = []
+        for wk, g in t.groupby("week"):
+            m0 = pd.Timestamp(wk)
+            wrows.append(metric_row(f"{m0:%d %b} – {m0 + timedelta(days=4):%d %b %Y}", metrics(g)))
+        s.append("<h3>Week-wise (Mon–Fri)</h3>" + table(["Week"] + MH[1:], wrows, tall=True))
         t["month"] = t["date"].str[:7]
         mrows = [metric_row(m, metrics(g)) for m, g in t.groupby("month")]
-        s.append("<h3>Month-wise</h3>" + table(["Month"] + MH[1:], [r for r in mrows]))
-        for title, col in (("By signal type (PE=UP spread, CE=DOWN spread)", "type"), ("By exit reason", "reason"),
-                           ("By weekday", "weekday")):
-            rr = [metric_row(str(k), metrics(g)) for k, g in t.groupby(col)]
-            s.append(f"<h3>{title}</h3>" + table([col.title()] + MH[1:], rr))
+        s.append("<h3>Month-wise</h3>" + table(["Month"] + MH[1:], mrows))
+    s.append("<h3>Equity curve (net, trade by trade)</h3>" + equity_svg(t))
     return "\n".join(s)
 
 
@@ -562,14 +628,14 @@ CSS = """
 @media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#e8e8e8;--mut:#888;--acc:#60a5fa;--pos:#4ade80;--neg:#f87171;--card:#232323}}
 body{font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:1100px;margin:0 auto;padding:16px}
 h1{font-size:22px}h2{margin-top:36px;border-top:1px solid var(--mut);padding-top:16px}h3{font-size:15px;margin:18px 0 6px}
-.sc{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}
+.sc{overflow-x:auto}.tall{max-height:440px;overflow:auto}.tall th{position:sticky;top:0}table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{padding:5px 9px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}
 th{background:var(--card)}tr:nth-child(even) td{background:var(--card)}
 .pos{color:var(--pos)}.neg{color:var(--neg)}.note{background:var(--card);padding:10px 14px;border-radius:8px;font-size:13px}
 """
 
 
-def build_report(results, cfg, last_day, first_day, outdir, notes):
+def build_report(results, cfg, last_day, first_day, outdir, notes, days_list=(), detail_days=7):
     cmp_rows = []
     avail = [(nm, d) for nm, d in PERIODS if d is None or d <= (last_day - first_day).days + 3]
     for (strat, tf), t in results.items():
@@ -604,11 +670,15 @@ def build_report(results, cfg, last_day, first_day, outdir, notes):
              f"<title>Nifty Backtest Report</title><style>{CSS}</style></head><body>",
              f"<h1>{title}</h1>",
              f"<p class='note'>{html.escape(setup)}</p>",
+             "<p class='note'>Trade rules: roz subah " + f"{cfg['entry_start']:%H:%M}" + " e je trend chalu hoy te mujab entry "
+             "(Entry type = Day start trend); pachhi signal flip thay to exit + ulti direction ma entry; SL/Target lage to "
+             "exit; trade end time " + f"{cfg['force_exit']:%H:%M}" + " e badhi position exit (Time exit). "
+             "Darek divas alag ganay chhe, overnight position nathi. Trade count aa mujab j che.</p>",
              f"<p class='note'>{html.escape(warn)}</p>",
              "<h2>Comparison – net P&L (period-wise)</h2>",
              table(["Strategy", "TF"] + [nm for nm, _ in avail], cmp_rows)]
     for key, t in results.items():
-        parts.append(combo_section(key, t, last_day, first_day))
+        parts.append(combo_section(key, t, last_day, first_day, list(days_list), detail_days))
     parts.append("</body></html>")
     path = os.path.join(outdir, "report.html")
     with open(path, "w", encoding="utf-8") as f:
@@ -719,6 +789,7 @@ def main(argv=None, in_bot=False, settings=None):
     ap.add_argument("--vix-csv"), ap.add_argument("--no-vix", action="store_true")
     ap.add_argument("--strategy-only", "--spot-only", action="store_true", dest="strategy_only",
                     help="option vagar fakt strategy report: Nifty spot par UP=long/DOWN=short, P&L points ma")
+    ap.add_argument("--detail-days", type=int, default=7, dest="detail_days", help="chhella ketla divas na trade-wise details")
     ap.add_argument("--out", default=os.path.join(nb.DATA_DIR, "backtest_report"))
     a = ap.parse_args(argv)
 
@@ -765,9 +836,10 @@ def main(argv=None, in_bot=False, settings=None):
             results[(s, tf)] = t
             t.to_csv(os.path.join(a.out, f"trades_{s}_{tf}m.csv"), index=False, encoding="utf-8-sig")
 
-    path = build_report(results, cfg, last_day, first_day, a.out, notes)
+    path = build_report(results, cfg, last_day, first_day, a.out, notes, sorted(str(x) for x in days_set), a.detail_days)
     avail = [(nm, d) for nm, d in PERIODS if d is None or d <= (last_day - first_day).days + 3]
-    summary = summary_text(results, last_day, first_day, avail)
+    dl_ = sorted(str(x) for x in days_set)
+    summary = summary_text(results, last_day, first_day, avail, dl_, a.detail_days)
     print("\nNet P&L (after slippage + costs)")
     print(f"{'Strategy':34}{'TF':>4} " + "".join(f"{nm:>12}" for nm, _ in avail))
     for (s, tf), t in results.items():
@@ -777,15 +849,29 @@ def main(argv=None, in_bot=False, settings=None):
     return path, summary
 
 
-def summary_text(results, last_day, first_day, avail):
-    """Telegram mate short text summary."""
+def summary_text(results, last_day, first_day, avail, days_list=(), detail_days=7):
+    """Telegram mate summary: period-wise + last N days day-wise + darek trade."""
     L = [f"📊 Backtest {first_day} → {last_day} " + ("(strategy-only, Nifty points)" if UNIT["pts"]
                                                        else "(net, slippage+cost pachhi)")]
-    for (s, tf), t in results.items():
-        L += ["", f"{nb.STRATEGIES.get(s, {}).get('label', s)} • {tf}m"]
+    lo = str(last_day - timedelta(days=detail_days - 1))
+    for (s_, tf), t in results.items():
+        L += ["", f"{nb.STRATEGIES.get(s_, {}).get('label', s_)} • {tf}m"]
         for nm, d in avail:
             m = metrics(period_slice(t, last_day, d))
             L.append(f"• {nm}: {inr(m['net'])} | {m['trades']} trades | win {m['win']:.0f}% | DD {inr(m['mdd'])}")
+        lw = t[t["date"] >= lo] if len(t) else t
+        L += ["", f"🗓 Last {detail_days} days (day-wise)"]
+        for d in [x for x in days_list if x >= lo]:
+            g = lw[lw["date"] == d] if len(lw) else lw
+            wd = pd.Timestamp(d).strftime("%a %d %b")
+            L.append(f"• {wd}: {len(g)} trades | {inr(g['net_pnl'].sum())}" if len(g) else f"• {wd}: no trade")
+        if len(results) <= 2 and len(lw):
+            L += ["", f"🔎 Trades (last {detail_days} days)"]
+            for _, r in lw.iterrows():
+                what = (f"{r['type']} {int(r['sell_strike'])}/{int(r['hedge_strike'])}" if "sell_strike" in lw.columns
+                        else ("Long" if r["trend"] == "UP" else "Short"))
+                L.append(f"{r['date'][5:]} {r['weekday']} #{int(r['trade_no'])} {r['entry_time']}→{r['exit_time']} "
+                         f"{r['trend']} {what} | {inr(r['net_pnl'])} | {r['reason']}")
     L += ["", "ℹ️ Strategy-only: Nifty points ma, option/cost vagar." if UNIT["pts"]
           else "⚠️ Option price Black-Scholes model thi - approximate."]
     return "\n".join(L)
