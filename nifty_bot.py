@@ -2648,21 +2648,44 @@ async def cmd_menu(update: Update, ctx):
     await update.message.reply_text(main_menu_text(), reply_markup=main_menu_kb())
 
 
-async def cmd_run(update: Update, ctx):
+_bg_tasks = set()
+
+
+async def _flash(target, text: str, secs: float = 3):
+    """Nano confirm message: thodi sec pachhi aapo-aap delete thai jay (chat ma raheto nathi)."""
+    try:
+        m = await target.reply_text(text)
+    except Exception:
+        return
+
+    async def _del():
+        await asyncio.sleep(secs)
+        try:
+            await m.delete()
+        except Exception:
+            pass
+    t = asyncio.create_task(_del())
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+async def cmd_run(update: Update, ctx, quiet=False):
     if not authorized(update):
         return
     state["running"] = True
     state["last_signal_candle"] = None
     save_state()
-    await update.message.reply_text(f"▶️ Bot running in {state['mode'].upper()} mode")
+    if not quiet:                 # button thi hoy to message nahi (toast + menu j confirm che)
+        await _flash(update.message, f"▶️ Bot running in {state['mode'].upper()} mode")
 
 
-async def cmd_stop(update: Update, ctx):
+async def cmd_stop(update: Update, ctx, quiet=False):
     if not authorized(update):
         return
     state["running"] = False
     save_state()
-    await update.message.reply_text("⏸ Bot stopped (open position hoy to /exit vapro)")
+    if not quiet:
+        await _flash(update.message, "⏸ Bot stopped (open position hoy to /exit vapro)")
 
 
 async def cmd_mode(update: Update, ctx):
@@ -3145,7 +3168,10 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if d in DIRECT:
             fn_, toast = DIRECT[d]
             await _ans(q, toast)
-            await fn_(_ShimUpdate(q, update), ctx)           # command j chale che (jem /run, /status)
+            if d in ("run", "stop"):
+                await fn_(_ShimUpdate(q, update), ctx, quiet=True)      # chat ma message nahi (toast + menu refresh)
+            else:
+                await fn_(_ShimUpdate(q, update), ctx)           # command j chale che (jem /status)
             if d in ("run", "stop"):
                 await show(main_menu_text(), main_menu_kb())
             return
@@ -3801,8 +3827,9 @@ async def post_init(app: Application):
                         else "\n\nBot STOPPED che. Navi entry mate neeche ▶️ Run dabavo.")
                 msg = "♻️ Bot restart thayo, juno data restore karyo:\n" + "\n".join(restore_notes) + tail
             else:
-                msg = "🟢 Bot online. Menu mate /menu."
-            await app.bot.send_message(ALLOWED_CHAT_ID, msg, reply_markup=kb_markup())
+                msg = None                       # normal start: chat ma koi message nahi
+            if msg:                              # fakt restore thayu hoy (jem ke open position) tyare j message
+                await app.bot.send_message(ALLOWED_CHAT_ID, msg, reply_markup=kb_markup())
         except Exception as e:
             log.warning("startup message fail: %s", e)
         if state["mode"] == "live":
