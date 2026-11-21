@@ -18,6 +18,7 @@ Telegram commands:
 import asyncio
 import csv
 import shutil
+import sys
 import html
 import io
 import json
@@ -3477,6 +3478,51 @@ async def cmd_signal(update: Update, ctx):
     await update.message.reply_text(await signal_text())
 
 
+_bt_running = {"on": False}
+
+
+async def cmd_backtest(update: Update, ctx):
+    """/backtest [--strategy all] [--tf 3,5] [--days 180] [--sl pct:40] ...  (backtest.py ni options)"""
+    if not authorized(update):
+        return
+    import shlex
+    args = list(ctx.args or [])
+    if args and args[0].lower() in ("help", "?"):
+        return await update.message.reply_text(
+            "📊 Backtest (aaj na bot settings mujab, option sell spread)\n\n"
+            "/backtest  → current strategy, 3 min, 365 divas\n"
+            "/backtest --strategy all --tf 3,5\n"
+            "/backtest --days 180 --sl pct:40 --tp pct:60\n"
+            "/backtest --offset 1 --hedge-pct 0.25 --iv 13\n\n"
+            "Options: --strategy supertrend|ema|rsi_wma|<custom key>|all  --tf 1,3,5,10,15,30  --days N\n"
+            "--sl/--tp pct:50|amount:2000|points:40  --lots --offset --hedge-pct --expiry w1|w2|m1\n"
+            "--slip 0.5  --cost 100  --iv 14  --no-vix")
+    if _bt_running["on"]:
+        return await update.message.reply_text("⏳ Backtest haju chalu che, puru thava do.")
+    _bt_running["on"] = True
+    await update.message.reply_text("⏳ Backtest chalu... (1-5 min lagse, bot normal chalse)")
+    # nifty_bot ne 'nifty_bot' naam thi j backtest ma import karva (same module, navi copy nahi)
+    sys.modules.setdefault("nifty_bot", sys.modules[__name__])
+
+    def work():
+        import backtest
+        return backtest.run_from_bot(args)
+    try:
+        path, summary = await asyncio.to_thread(work)
+        for part in _chunks(summary):
+            await update.message.reply_text(part)
+        with open(path, "rb") as f:
+            data = f.read()
+        await update.message.reply_document(document=data, filename="backtest_report.html",
+                                            caption="📄 Full report (browser ma kholo)")
+    except Exception as e:
+        log.exception("backtest fail")
+        await update.message.reply_text(f"⚠️ Backtest fail: {e}")
+    finally:
+        _bt_running["on"] = False
+
+
+
 async def cmd_help(update: Update, ctx):
     if not authorized(update):
         return
@@ -3807,6 +3853,7 @@ async def post_init(app: Application):
         BotCommand("sound", "🔔 Alert sound ON/OFF"),
         BotCommand("newstrategy", "➕ Navi strategy + condition add"),
         BotCommand("testalert", "🔔 Alert / sound test (/testalert 10 = 10 sec pachhi)"),
+        BotCommand("backtest", "📊 Backtest report (/backtest help)"),
         BotCommand("history", "🗂 History + summary + CSV"),
         BotCommand("time", "🕒 Start/End time set (/time start 09:30)"),
         BotCommand("sl", "🛡 Stop loss set (/sl 2000 amt)"),
@@ -4592,7 +4639,7 @@ def main():
                      ("status", cmd_status), ("pnl", cmd_pnl), ("live", cmd_live), ("exit", cmd_exit),
                      ("signal", cmd_signal), ("summary", cmd_summary), ("help", cmd_help),
                      ("dashboard", cmd_dashboard), ("history", cmd_history),
-                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid), ("newstrategy", cmd_newstrategy), ("testalert", cmd_testalert)]:
+                     ("sl", cmd_sl), ("target", cmd_target), ("tp", cmd_target), ("time", cmd_time), ("trades", cmd_trades), ("export", cmd_export), ("expiry", cmd_expiry), ("daylimit", cmd_daylimit), ("testorder", cmd_testorder), ("orders", cmd_orders), ("strike", cmd_strike), ("storage", cmd_storage), ("keyboard", cmd_keyboard), ("sync", cmd_sync), ("maxtrades", cmd_maxtrades), ("sound", cmd_sound), ("chatid", cmd_chatid), ("newstrategy", cmd_newstrategy), ("testalert", cmd_testalert), ("backtest", cmd_backtest)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_bottom_text))
