@@ -260,6 +260,17 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
         atm = round(S / step) * step
         K = atm + sign * cfg["offset"] * step
         sp = tick(prem(S, K, typ, t))
+        if cfg["sell_premium"] > 0:                          # ATM nahi: je strike no premium ~target hoy te sell
+            best = None
+            for k in range(-9, 41):
+                Kc = atm + sign * k * step
+                pc = tick(prem(S, Kc, typ, t))
+                if pc > 0 and (best is None or abs(pc - cfg["sell_premium"]) < abs(best[1] - cfg["sell_premium"])
+                               or (abs(pc - cfg["sell_premium"]) == abs(best[1] - cfg["sell_premium"]) and k > best[2])):
+                    best = (Kc, pc, k)
+            if best is None:
+                return
+            K, sp = best[0], best[1]
         if sp <= 0:
             return
         target, best = sp * cfg["hedge_pct"], None
@@ -654,7 +665,7 @@ def build_report(results, cfg, last_day, first_day, outdir, notes, days_list=(),
         warn = ("Aa report fakt strategy na signal ni che: Nifty spot par entry/exit (UP = long, DOWN = short), "
                 "P&L Nifty POINTS ma. Option premium, slippage ke cost ganya nathi.")
     setup = (f"Data: {first_day} → {last_day} | Lots {cfg['lots']} × {cfg['lot_size']} | Sell: "
-             f"{nb.sell_label(cfg['offset'])} | Hedge ≈ {cfg['hedge_pct'] * 100:.0f}% premium | SL {sl} | Target {tp} | "
+             f"{('premium ~₹%.0f' % cfg['sell_premium']) if cfg['sell_premium'] > 0 else nb.sell_label(cfg['offset'])} | Hedge ≈ {cfg['hedge_pct'] * 100:.0f}% premium | SL {sl} | Target {tp} | "
              f"Expiry {cfg['expiry_mode']} | Entry {cfg['entry_start']:%H:%M}-{cfg['last_entry']:%H:%M}, "
              f"force exit {cfg['force_exit']:%H:%M} | Flip exit {'ON' if cfg['exit_on_flip'] else 'OFF'} | "
              f"1 trade/trend {'ON' if cfg['one_trade'] else 'OFF'} | Day limit {'ON' if cfg['day_limit_on'] else 'OFF'} | "
@@ -705,7 +716,7 @@ def build_cfg(a):
         except Exception as e:
             print(f"Saved settings vachay nahi ({e}) -> nifty_bot.py na default vapriye chhiye")
     cfg = {"lots": nb.LOTS, "lot_size": nb.LOT_SIZE, "step": nb.STRIKE_STEP, "hedge_pct": nb.HEDGE_PCT,
-           "offset": nb.SELL_OFFSET, "sl_mode": nb.SL_MODE, "sl_val": nb.SL_VALUE, "tp_mode": nb.TP_MODE,
+           "offset": nb.SELL_OFFSET, "sell_premium": float(getattr(nb, "SELL_PREMIUM", 0.0)), "sl_mode": nb.SL_MODE, "sl_val": nb.SL_VALUE, "tp_mode": nb.TP_MODE,
            "tp_val": nb.TP_VALUE, "exit_on_flip": nb.EXIT_ON_FLIP, "entry_start": nb.ENTRY_START,
            "last_entry": nb.LAST_ENTRY, "force_exit": nb.FORCE_EXIT, "one_trade": nb.ONE_TRADE_PER_TREND,
            "expiry_mode": nb.EXPIRY_MODE, "expiry_skip_today": nb.EXPIRY_SKIP_TODAY,
@@ -720,6 +731,8 @@ def build_cfg(a):
                  ("expiry_mode", a.expiry)):
         if v is not None:
             cfg[k] = v
+    if a.sell_premium is not None:
+        cfg["sell_premium"] = a.sell_premium
     if a.no_flip_exit:
         cfg["exit_on_flip"] = False
     if a.allow_retrade:
@@ -747,6 +760,7 @@ def cfg_from_settings(st):
             return cur
     c = {"lots": int(st.get("LOTS", nb.LOTS)), "hedge_pct": float(st.get("HEDGE_PCT", nb.HEDGE_PCT)),
          "offset": int(st.get("SELL_OFFSET", nb.SELL_OFFSET)),
+         "sell_premium": float(st.get("SELL_PREMIUM", 0.0) or 0.0),
          "exit_on_flip": bool(st.get("EXIT_ON_FLIP", nb.EXIT_ON_FLIP)),
          "entry_start": t("ENTRY_START", nb.ENTRY_START), "last_entry": t("LAST_ENTRY", nb.LAST_ENTRY),
          "force_exit": t("FORCE_EXIT", nb.FORCE_EXIT),
@@ -775,6 +789,8 @@ def main(argv=None, in_bot=False, settings=None):
     ap.add_argument("--sl"), ap.add_argument("--tp")
     ap.add_argument("--lots", type=int), ap.add_argument("--lot-size", type=int, dest="lot_size")
     ap.add_argument("--offset", type=int, help="sell strike: 0 ATM, +n OTM, -n ITM")
+    ap.add_argument("--sell-premium", type=float, dest="sell_premium",
+                    help="ATM nahi: je strike no premium ~aa amount (Rs/unit) hoy te sell (0 = off)")
     ap.add_argument("--hedge-pct", type=float, dest="hedge_pct")
     ap.add_argument("--expiry", choices=list(nb.EXPIRY_MODES))
     ap.add_argument("--no-flip-exit", action="store_true"), ap.add_argument("--allow-retrade", action="store_true")

@@ -91,6 +91,7 @@ LOTS = 1
 STRIKE_STEP = 50
 HEDGE_PCT = 0.30       # hedge premium = 30% of SOLD option premium (hedge, sell strike thi bahar)
 SELL_OFFSET = 0        # sell strike: 0=ATM, +1..+5 = OTM-1..5, -1..-5 = ITM-1..5 (Telegram Settings / /strike)
+SELL_PREMIUM = 0.0     # >0 hoy to ATM nahi, je strike no premium ~aa amount (Rs per unit) hoy te sell thase. 0 = OFF
 # SL / Target: mode = "pct" (% of net credit) | "amount" (₹ total) | "points" (premium points per unit)
 SL_MODE, SL_VALUE = "pct", 50.0
 TP_MODE, TP_VALUE = "pct", 50.0
@@ -977,7 +978,7 @@ _cfg_lock = threading.RLock()              # settings swap thay tyare worker thr
 
 def snapshot_settings() -> dict:
     """Atyaar ni (active mode ni) badhi setting."""
-    return {"LOTS": LOTS, "HEDGE_PCT": HEDGE_PCT, "SELL_OFFSET": SELL_OFFSET, "SL_MODE": SL_MODE, "SL_VALUE": SL_VALUE,
+    return {"LOTS": LOTS, "HEDGE_PCT": HEDGE_PCT, "SELL_OFFSET": SELL_OFFSET, "SELL_PREMIUM": SELL_PREMIUM, "SL_MODE": SL_MODE, "SL_VALUE": SL_VALUE,
             "TP_MODE": TP_MODE, "TP_VALUE": TP_VALUE, "EXIT_ON_FLIP": EXIT_ON_FLIP,
             "ENTRY_START": ENTRY_START.strftime("%H:%M"), "LAST_ENTRY": LAST_ENTRY.strftime("%H:%M"),
             "FORCE_EXIT": FORCE_EXIT.strftime("%H:%M"),
@@ -993,6 +994,7 @@ def apply_settings(st: dict):
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP
     global ENTRY_START, LAST_ENTRY, FORCE_EXIT, ONE_TRADE_PER_TREND, HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY
     global DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET, MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
+    global SELL_PREMIUM
     st = st or {}
     _mt = int(st.get("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY))
     MAX_TRADES_PER_DAY = max(1, min(100, _mt)) if _mt > 0 else MAX_TRADES_PER_DAY
@@ -1002,6 +1004,7 @@ def apply_settings(st: dict):
     LOTS = int(st.get("LOTS", LOTS))
     HEDGE_PCT = float(st.get("HEDGE_PCT", HEDGE_PCT))
     SELL_OFFSET = max(-5, min(5, int(st.get("SELL_OFFSET", SELL_OFFSET))))
+    SELL_PREMIUM = max(0.0, min(1000.0, float(st.get("SELL_PREMIUM", 0.0) or 0.0)))   # juna profile ma nahi -> OFF
     if st.get("SL_MODE") in MODE_INFO and st.get("TP_MODE") in MODE_INFO:
         SL_MODE, SL_VALUE = st["SL_MODE"], float(st.get("SL_VALUE", SL_VALUE))
         TP_MODE, TP_VALUE = st["TP_MODE"], float(st.get("TP_VALUE", TP_VALUE))
@@ -1077,7 +1080,7 @@ def _do_action(d: str, inactive: bool):
     """Setting button no sync action. Return (toast, alert)."""
     global LOTS, HEDGE_PCT, SL_MODE, SL_VALUE, TP_MODE, TP_VALUE, EXIT_ON_FLIP, ONE_TRADE_PER_TREND
     global HISTORY_DAYS, EXPIRY_MODE, EXPIRY_SKIP_TODAY, DAY_LIMIT_ON, DAY_LOSS_LIMIT, DAY_PROFIT_LIMIT, SELL_OFFSET
-    global MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND
+    global MAX_TRADES_PER_DAY, MAX_TRADES_ON, ALERT_SOUND, SELL_PREMIUM
     if d.startswith("set_"):
         _, key, val = d.split("_", 2)
         v = int(val)
@@ -1085,6 +1088,9 @@ def _do_action(d: str, inactive: bool):
             LOTS = max(1, min(50, LOTS + v))
         elif key == "soff":
             SELL_OFFSET = max(-5, min(5, SELL_OFFSET + v))
+            SELL_PREMIUM = 0.0                         # ATM/OTM/ITM select karyu -> premium mode OFF
+        elif key == "sprem":                       # premium-wise sell: 0 = OFF
+            SELL_PREMIUM = float(max(0, min(1000, int(SELL_PREMIUM) + v)))
         elif key == "hedge":
             HEDGE_PCT = max(0.10, min(0.60, round(HEDGE_PCT + v / 100, 2)))
         elif key == "slm":
@@ -1230,7 +1236,7 @@ def settings_hub():
     """Settings ni pehli screen: Paper ane Live alag button."""
     def summ(prof):
         def f():
-            return (f"Lots {LOTS} • {sell_label(SELL_OFFSET)} • Hedge {HEDGE_PCT * 100:.0f}% • "
+            return (f"Lots {LOTS} • {sell_desc()} • Hedge {HEDGE_PCT * 100:.0f}% • "
                     f"SL {limit_short(SL_MODE, SL_VALUE)} • TP {limit_short(TP_MODE, TP_VALUE)}\n"
                     f"   {strategy_label()} {CANDLE_MINUTES}m • {ENTRY_START:%H:%M}-{LAST_ENTRY:%H:%M} • "
                     f"Limit {'ON' if DAY_LIMIT_ON else 'OFF'}")
@@ -1520,6 +1526,11 @@ def sell_label(off: int) -> str:
     return "ATM" if off == 0 else (f"OTM-{off}" if off > 0 else f"ITM-{-off}")
 
 
+def sell_desc() -> str:
+    """Sell strike nu short vivaran: premium-wise hoy to te, nahitar ATM/OTM/ITM."""
+    return f"Premium ~₹{SELL_PREMIUM:.0f}" if SELL_PREMIUM > 0 else sell_label(SELL_OFFSET)
+
+
 def sell_strike_for(opt_type: str, atm: float) -> float:
     """OTM: PE ma niche, CE ma upar. ITM: ulatu."""
     sign = -1 if opt_type == "PE" else 1
@@ -1532,7 +1543,9 @@ def plan_text(d: int, atm: float) -> str:
     if ONE_TRADE_PER_TREND and state["blocked_dir"] == d and not state["position"]:
         return "Wait for trend flip"
     ot = "PE" if d == 1 else "CE"
-    return f"SELL {sell_strike_for(ot, atm):.0f} {ot} ({sell_label(SELL_OFFSET)}) + hedge"
+    if SELL_PREMIUM > 0:
+        return f"SELL {ot} premium ~₹{SELL_PREMIUM:.0f} + hedge"
+    return f"SELL {sell_strike_for(ot, atm):.0f} {ot} ({sell_desc()}) + hedge"
 
 
 def strategy_line() -> str:
@@ -2110,7 +2123,34 @@ def pick_legs_batch(opt_type, atm, expiry):
     return strip(sell), sell_px, strip(hedge), px[hedge["token"]]
 
 
+def pick_sell_by_premium(opt_type, atm, expiry, target):
+    """Je strike no premium (LTP) target ni sauthi nazik hoy te strike. ITM-9 ... OTM-40 ma shodhe (ek j API call)."""
+    sign = -1 if opt_type == "PE" else 1
+    sub = scrips[(scrips["expiry_d"] == expiry) & (scrips["symbol"].str.endswith(opt_type))]
+    by_strike = {float(r.strike_f): r for r in sub.itertuples()}
+    cands = []
+    for step in range(-9, 41):
+        strike = atm + sign * step * STRIKE_STEP
+        r = by_strike.get(float(strike))
+        if r is not None:
+            cands.append((step, strike, r.token))
+    if not cands:
+        raise RuntimeError("Premium-wise strike nathi malyo")
+    r = throttled(smart.getMarketData, "LTP", {"NFO": [c[2] for c in cands]}, retries=1)
+    rows = ((r or {}).get("data") or {}).get("fetched") if isinstance(r, dict) else None
+    if not rows:
+        raise RuntimeError(f"batch LTP nathi malyo: {r}")
+    px = {str(x.get("symbolToken")): float(x["ltp"]) for x in rows if x.get("ltp") is not None}
+    pool = [(abs(px[c[2]] - target), -c[0], c[1]) for c in cands if px.get(c[2], 0) > 0]   # barabar hoy to OTM gano
+    if not pool:
+        raise RuntimeError("Premium-wise strike: LTP nathi malyo")
+    _, _, strike = min(pool)
+    ltp_ = next(px[c[2]] for c in cands if c[1] == strike)
+    return strike, ltp_
+
+
 pick_hedge = _locked(pick_hedge)
+pick_sell_by_premium = _locked(pick_sell_by_premium)
 pick_legs_batch = _locked(pick_legs_batch)
 current_signal = _locked(current_signal)
 
@@ -2125,9 +2165,16 @@ async def open_position(direction: int, app: Application):
     t0 = time.time()
     spot = await spot_cached()                       # WS / poller thi fast price
     atm = round(spot / STRIKE_STEP) * STRIKE_STEP
-    sell_strike = sell_strike_for(opt_type, atm)      # ATM / OTM-n / ITM-n (setting mujab)
-    sel_lbl = sell_label(SELL_OFFSET)
     expiry = nearest_expiry()
+    sell_strike = sell_strike_for(opt_type, atm)      # ATM / OTM-n / ITM-n (setting mujab)
+    sel_lbl = sell_desc()
+    if SELL_PREMIUM > 0:                              # premium-wise: je strike no premium ~SELL_PREMIUM te sell
+        try:
+            sell_strike, _pp = await asyncio.to_thread(pick_sell_by_premium, opt_type, atm, expiry, SELL_PREMIUM)
+            sel_lbl = f"Premium ~₹{SELL_PREMIUM:.0f} (strike {sell_strike:.0f}, LTP {_pp:.2f})"
+        except Exception as e:
+            log.warning("premium-wise sell strike fail (%s) -> ATM/OTM setting vapryu", e)
+            await notify(app, f"⚠️ Premium-wise strike nathi malyo ({e}) → {sell_label(SELL_OFFSET)} vapryu.")
     qty = LOT_SIZE * LOTS
 
     try:
@@ -2797,14 +2844,11 @@ def main_menu_kb() -> Markup:
     return Markup([
         [Btn("📺 Dashboard", callback_data="dashboard")],
         [Btn("🟢 Run Bot", callback_data="run"), Btn("🔴 Stop Bot", callback_data="stop")],
-        [Btn("📡 Signal", callback_data="signal"), Btn("🧠 Strategy", callback_data="strategy")],
-        [Btn("📅 Today's Summary", callback_data="summary"), Btn("💹 Live PnL", callback_data="live")],
-        [Btn("📊 Status", callback_data="status"), Btn("💰 PnL", callback_data="pnl")],
+        [Btn("📡 Signal", callback_data="signal"), Btn("📊 Status", callback_data="status")],
         [Btn("📜 Today Trades", callback_data="trades"), Btn("🗂 History", callback_data="history")],
         [Btn("🚪 Exit Position", callback_data="exit")],
         [Btn("📝 Paper Mode", callback_data="mode_paper"), Btn("⚡ Live Mode", callback_data="mode_live")],
         [Btn("⚙️ Settings", callback_data="settings"), Btn("🧪 Angel Test", callback_data="angeltest")],
-        [Btn("📊 Backtest", callback_data="bt_menu")],
         [Btn("🔄 Refresh", callback_data="menu"), Btn("📒 Angel Orders", callback_data="angelorders")],
         [Btn("❓ Help", callback_data="help"), Btn("❌ Close", callback_data="close")],
     ])
@@ -2963,7 +3007,7 @@ def settings_text(prof=None) -> str:
     return (f"{'⚡ LIVE' if prof == 'live' else '📝 PAPER'} settings ({tag}) • navi trade thi lagu\n"
             f"🧠 Strategy: {strategy_label()} • ⏱ {CANDLE_MINUTES}m\n"
             f"Lots: {LOTS} (qty {LOT_SIZE * LOTS})\n"
-            f"Sell strike: {sell_label(SELL_OFFSET)}\n"
+            f"Sell strike: {sell_desc()}" + (" (ATM/OTM badle premium-wise)" if SELL_PREMIUM > 0 else "") + "\n"
             f"Hedge premium: {HEDGE_PCT * 100:.0f}% of sold option\n"
             f"🛡 Stop loss: {limit_text(SL_MODE, SL_VALUE)}\n"
             f"🎯 Target: {limit_text(TP_MODE, TP_VALUE)}\n"
@@ -2992,8 +3036,13 @@ def settings_kb(prof=None) -> Markup:
     return Markup([
         [Btn("➖ Lots", callback_data="set_lots_-1"), Btn(f"{LOTS}", callback_data="noop"),
          Btn("➕ Lots", callback_data="set_lots_1")],
-        [Btn("◀ ITM", callback_data="set_soff_-1"), Btn(f"Sell: {sell_label(SELL_OFFSET)}", callback_data="noop"),
+        [Btn("◀ ITM", callback_data="set_soff_-1"), Btn(f"Sell: {sell_desc()}", callback_data="noop"),
          Btn("OTM ▶", callback_data="set_soff_1")],
+        [Btn("➖10", callback_data="set_sprem_-10"),
+         Btn(f"Sell premium: {('₹' + format(SELL_PREMIUM, '.0f')) if SELL_PREMIUM > 0 else 'OFF'}", callback_data="noop"),
+         Btn("➕10", callback_data="set_sprem_10")],
+        [Btn("➖50", callback_data="set_sprem_-50"), Btn("🚫 Premium OFF", callback_data="set_sprem_-9999"),
+         Btn("➕50", callback_data="set_sprem_50")],
         [Btn("➖ Hedge%", callback_data="set_hedge_-5"), Btn(f"{HEDGE_PCT * 100:.0f}%", callback_data="noop"),
          Btn("➕ Hedge%", callback_data="set_hedge_5")],
         [Btn(f"🛡 SL type: {MODE_INFO[SL_MODE]['name']} 🔄", callback_data="set_slm_0")],
@@ -3538,7 +3587,7 @@ async def _backtest_job(msg, runner, title: str):
 def backtest_text() -> str:
     def summ(prof):
         def f():
-            return (f"{strategy_label()} {CANDLE_MINUTES}m • Lots {LOTS} • {sell_label(SELL_OFFSET)} • "
+            return (f"{strategy_label()} {CANDLE_MINUTES}m • Lots {LOTS} • {sell_desc()} • "
                     f"Hedge {HEDGE_PCT * 100:.0f}% • SL {limit_short(SL_MODE, SL_VALUE)} • "
                     f"TP {limit_short(TP_MODE, TP_VALUE)}")
         return _with_profile(prof, f)
@@ -3582,6 +3631,7 @@ async def cmd_backtest(update: Update, ctx):
             "/backtest --strategy-only --strategy all --tf 3,5 --sl points:40 --tp points:80\n\n"
             "Options: --strategy supertrend|ema|rsi_wma|<custom key>|all  --tf 1,3,5,10,15,30  --days N\n"
             "--sl/--tp pct:50|amount:2000|points:40  --lots --offset --hedge-pct --expiry w1|w2|m1\n"
+            "--sell-premium 100  → ATM nahi, premium ~₹100 wala strike sell\n"
             "--slip 0.5  --cost 100  --iv 14  --no-vix",
             reply_markup=Markup([[Btn("📊 Backtest menu", callback_data="bt_menu")]]))
     await _backtest_job(update.message, lambda bt: bt.run_from_bot(args), "Backtest (current setting)")
@@ -3670,21 +3720,35 @@ async def cmd_storage(update: Update, ctx):
 
 
 async def cmd_strike(update: Update, ctx):
-    global SELL_OFFSET
+    global SELL_OFFSET, SELL_PREMIUM
     if not authorized(update):
         return
-    usage = (f"🎯 Sell strike: {sell_label(SELL_OFFSET)}\n\n/strike atm\n/strike otm1 ... otm5\n/strike itm1 ... itm5\n"
+    usage = (f"🎯 Sell strike: {sell_desc()}\n\n/strike atm\n/strike otm1 ... otm5\n/strike itm1 ... itm5\n"
+             f"/strike premium 100  → ATM nahi, je strike no premium ~₹100 hoy te sell\n/strike premium off\n"
              f"Hedge sold option na premium na {HEDGE_PCT * 100:.0f}% mujab, sell strike thi bahar select thase.\n"
              f"(Navi trade thi lagu)")
     if not ctx.args:
         return await update.message.reply_text(usage)
+    if ctx.args[0].lower() in ("premium", "prem", "p"):
+        arg = (ctx.args[1].lower() if len(ctx.args) > 1 else "")
+        if arg in ("off", "0", "no"):
+            SELL_PREMIUM = 0.0
+        else:
+            try:
+                SELL_PREMIUM = float(max(10, min(1000, float(arg.replace("₹", "")))))
+            except ValueError:
+                return await update.message.reply_text("❌ Premium amount lakho. Jem ke: /strike premium 100  (ke /strike premium off)")
+        save_state()
+        return await update.message.reply_text(
+            f"✅ Sell strike: {sell_desc()}\nHedge: sold premium na {HEDGE_PCT * 100:.0f}% mujab (navi trade thi lagu)")
     a = ctx.args[0].lower().replace("-", "").replace("_", "")
     m = re.fullmatch(r"(atm|otm([1-5])|itm([1-5]))", a)
     if not m:
         return await update.message.reply_text("❌ Samajyu nahi.\n\n" + usage)
     SELL_OFFSET = 0 if a == "atm" else (int(m.group(2)) if m.group(2) else -int(m.group(3)))
+    SELL_PREMIUM = 0.0                                 # premium mode OFF
     save_state()
-    await update.message.reply_text(f"✅ Sell strike: {sell_label(SELL_OFFSET)} (navi trade thi lagu)")
+    await update.message.reply_text(f"✅ Sell strike: {sell_desc()} (navi trade thi lagu)")
 
 
 async def cmd_daylimit(update: Update, ctx):
