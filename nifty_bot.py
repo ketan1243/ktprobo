@@ -3496,7 +3496,9 @@ async def cmd_backtest(update: Update, ctx):
             "/backtest  → current strategy, 3 min, 365 divas\n"
             "/backtest --strategy all --tf 3,5\n"
             "/backtest --days 180 --sl pct:40 --tp pct:60\n"
-            "/backtest --offset 1 --hedge-pct 0.25 --iv 13\n\n"
+            "/backtest --offset 1 --hedge-pct 0.25 --iv 13\n"
+            "/backtest --strategy-only  → option vagar, fakt strategy report (Nifty points ma)\n"
+            "/backtest --strategy-only --strategy all --tf 3,5 --sl points:40 --tp points:80\n\n"
             "Options: --strategy supertrend|ema|rsi_wma|<custom key>|all  --tf 1,3,5,10,15,30  --days N\n"
             "--sl/--tp pct:50|amount:2000|points:40  --lots --offset --hedge-pct --expiry w1|w2|m1\n"
             "--slip 0.5  --cost 100  --iv 14  --no-vix")

@@ -362,13 +362,109 @@ def sim_day(day, g, strat, tf, cfg, iv_atm, expiry_fn):
     return out
 
 
+def sim_day_spot(day, g, strat, tf, cfg):
+    """Strategy-only: option vagar. UP signal = Nifty long, DOWN = short. P&L Nifty points ma."""
+    n = len(g)
+    dt = timedelta(minutes=tf)
+    st = [t.to_pydatetime() for t in g["time"]]
+    en = [x + dt for x in st]
+    O, H, L, C = (g[c].values.astype(float) for c in ("open", "high", "low", "close"))
+    dir_at = make_dirs(strat, g)
+    entry_start, last_entry = datetime.combine(day, cfg["entry_start"]), datetime.combine(day, cfg["last_entry"])
+    force = datetime.combine(day, cfg["force_exit"])
+    sl, tp = cfg["spot_sl"], cfg["spot_tp"]
+    S_ = {"pos": None, "closed": 0, "halt": False, "blocked": None}
+    out = []
+
+    def spot_at(i, t):
+        fr = min(max((t - st[i]) / dt, 0.0), 1.0)
+        return O[i] + (C[i] - O[i]) * fr
+
+    def close(p, t, pts, reason, Sx):
+        out.append({"date": str(day), "weekday": day.strftime("%a"), "entry_time": p["t_in"].strftime("%H:%M"),
+                    "exit_time": t.strftime("%H:%M"),
+                    "duration_min": round((t - p["t_in"]).total_seconds() / 60, 1), "strategy": strat, "tf": tf,
+                    "type": "UP" if p["dir"] == 1 else "DOWN", "entry_spot": round(p["S_in"], 1),
+                    "exit_spot": round(Sx, 1), "gross_pnl": round(pts, 2), "costs": 0.0,
+                    "net_pnl": round(pts, 2), "net_pts": round(pts, 2), "reason": reason})
+        S_["closed"] += 1
+        S_["blocked"] = p["dir"]
+        S_["pos"] = None
+        if cfg["max_trades_on"] and S_["closed"] >= cfg["max_trades"]:
+            S_["halt"] = True
+
+    def open_pos(direction, t, S, bar):
+        if S_["halt"]:
+            return
+        if cfg["max_trades_on"] and S_["closed"] >= cfg["max_trades"]:
+            S_["halt"] = True
+            return
+        S_["pos"] = {"dir": direction, "S_in": S, "t_in": t, "bar": bar}
+
+    def manage(i):
+        p = S_["pos"]
+        seg_s = max(st[i], p["t_in"])
+        if seg_s >= force:
+            S = spot_at(i, seg_s)
+            return close(p, seg_s, (S - p["S_in"]) * p["dir"], "Time exit", S)
+        seg_e = min(en[i], force)
+        if sl or tp:
+            if p["bar"] < i:
+                p0 = (O[i] - p["S_in"]) * p["dir"]
+                if sl and p0 <= -sl:
+                    return close(p, seg_s, p0, "STOP LOSS (gap)", O[i])
+                if tp and p0 >= tp:
+                    return close(p, seg_s, p0, "TARGET (gap)", O[i])
+            lo_, hi_ = (min(p["S_in"], C[i]), max(p["S_in"], C[i])) if p["t_in"] > st[i] else (L[i], H[i])
+            adv, fav = (lo_, hi_) if p["dir"] == 1 else (hi_, lo_)
+            hit_sl = bool(sl) and (adv - p["S_in"]) * p["dir"] <= -sl
+            hit_tp = bool(tp) and (fav - p["S_in"]) * p["dir"] >= tp
+            if hit_sl and hit_tp:
+                hit_sl, hit_tp = (False, True) if cfg["tp_first"] else (True, False)
+            tm = st[i] + (seg_e - seg_s) / 2 if seg_e > seg_s else seg_s
+            if hit_sl:
+                return close(p, tm, -sl, "STOP LOSS", adv)
+            if hit_tp:
+                return close(p, tm, tp, "TARGET", fav)
+        if force <= en[i]:
+            S = spot_at(i, force)
+            return close(p, force, (S - p["S_in"]) * p["dir"], "Time exit", S)
+
+    for i in range(n):
+        d_prev = dir_at(i - 1) if i >= 1 else 0
+        if d_prev != 0 and S_["blocked"] is not None and d_prev != S_["blocked"]:
+            S_["blocked"] = None
+        if S_["pos"] is None and not S_["halt"] and d_prev != 0 and i >= 1:
+            t_in = max(st[i], entry_start)
+            if not (cfg["one_trade"] and S_["blocked"] == d_prev) and t_in < en[i] and t_in <= last_entry:
+                open_pos(d_prev, t_in, spot_at(i, t_in), i)
+        if S_["pos"] is not None:
+            manage(i)
+        if S_["pos"] is not None and cfg["exit_on_flip"]:
+            d_now = dir_at(i)
+            p = S_["pos"]
+            if d_now != 0 and d_now != p["dir"]:
+                close(p, en[i], (C[i] - p["S_in"]) * p["dir"], "Signal flip", C[i])
+                if en[i] <= last_entry and i + 1 < n:
+                    open_pos(d_now, en[i], C[i], i + 1)
+        if S_["pos"] is None and (S_["halt"] or st[i] >= last_entry) and i >= 1:
+            break
+    if S_["pos"] is not None:
+        p = S_["pos"]
+        close(p, en[n - 1], (C[n - 1] - p["S_in"]) * p["dir"], "Data end", C[n - 1])
+    return out
+
+
 def run_combo(df, strat, tf, cfg, ivmap, expiry_fn):
     rows = []
     for day, g in df.groupby(df["time"].dt.date, sort=True):
         g = g.reset_index(drop=True)
         if len(g) < 3:
             continue
-        rows += sim_day(day, g, strat, tf, cfg, ivmap.get(day, cfg["iv"]), expiry_fn)
+        if cfg["spot_only"]:
+            rows += sim_day_spot(day, g, strat, tf, cfg)
+        else:
+            rows += sim_day(day, g, strat, tf, cfg, ivmap.get(day, cfg["iv"]), expiry_fn)
     return pd.DataFrame(rows)
 
 
@@ -395,7 +491,12 @@ def period_slice(t, last_day, days):
     return t[t["date"] > cut]
 
 
+UNIT = {"pts": False}      # strategy-only mode ma P&L Nifty points ma
+
+
 def inr(x):
+    if UNIT["pts"]:
+        return f"{x:+,.0f} pts"
     return f"{'-' if x < 0 else ''}₹{abs(x):,.0f}"
 
 
@@ -479,6 +580,13 @@ def build_report(results, cfg, last_day, first_day, outdir, notes):
         cmp_rows.append(r)
     sl = nb.limit_short(cfg["sl_mode"], cfg["sl_val"])
     tp = nb.limit_short(cfg["tp_mode"], cfg["tp_val"])
+    title = "Nifty Credit-Spread Backtest Report"
+    warn = ("⚠️ Option premium Black-Scholes model thi (IV: " + notes + "). Real expired option data na hoy, etle result "
+            "approximate che — live/paper result thi thodo alag aavse. Net P&L = gross − slippage − costs.")
+    if cfg["spot_only"]:
+        title = "Nifty Strategy-Only Backtest Report"
+        warn = ("Aa report fakt strategy na signal ni che: Nifty spot par entry/exit (UP = long, DOWN = short), "
+                "P&L Nifty POINTS ma. Option premium, slippage ke cost ganya nathi.")
     setup = (f"Data: {first_day} → {last_day} | Lots {cfg['lots']} × {cfg['lot_size']} | Sell: "
              f"{nb.sell_label(cfg['offset'])} | Hedge ≈ {cfg['hedge_pct'] * 100:.0f}% premium | SL {sl} | Target {tp} | "
              f"Expiry {cfg['expiry_mode']} | Entry {cfg['entry_start']:%H:%M}-{cfg['last_entry']:%H:%M}, "
@@ -486,13 +594,17 @@ def build_report(results, cfg, last_day, first_day, outdir, notes):
              f"1 trade/trend {'ON' if cfg['one_trade'] else 'OFF'} | Day limit {'ON' if cfg['day_limit_on'] else 'OFF'} | "
              f"Max trades {cfg['max_trades'] if cfg['max_trades_on'] else 'OFF'} | Slippage {cfg['slip']} pt/fill + "
              f"₹{cfg['cost']:.0f}/trade costs")
+    if cfg["spot_only"]:
+        setup = (f"STRATEGY-ONLY (option vagar) | Data: {first_day} → {last_day} | SL {cfg['spot_sl'] or 'nathi'} pts | "
+                 f"Target {cfg['spot_tp'] or 'nathi'} pts | Entry {cfg['entry_start']:%H:%M}-{cfg['last_entry']:%H:%M}, "
+                 f"force exit {cfg['force_exit']:%H:%M} | Flip exit {'ON' if cfg['exit_on_flip'] else 'OFF'} | "
+                 f"1 trade/trend {'ON' if cfg['one_trade'] else 'OFF'} | "
+                 f"Max trades {cfg['max_trades'] if cfg['max_trades_on'] else 'OFF'}")
     parts = [f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
              f"<title>Nifty Backtest Report</title><style>{CSS}</style></head><body>",
-             "<h1>Nifty Credit-Spread Backtest Report</h1>",
+             f"<h1>{title}</h1>",
              f"<p class='note'>{html.escape(setup)}</p>",
-             "<p class='note'>⚠️ Option premium Black-Scholes model thi (IV: "
-             + html.escape(notes) + "). Real expired option data na hoy, etle result approximate che — live/paper result thi "
-             "thodo alag aavse. Net P&L = gross − slippage − costs.</p>",
+             f"<p class='note'>{html.escape(warn)}</p>",
              "<h2>Comparison – net P&L (period-wise)</h2>",
              table(["Strategy", "TF"] + [nm for nm, _ in avail], cmp_rows)]
     for key, t in results.items():
@@ -578,6 +690,8 @@ def main(argv=None, in_bot=False):
     ap.add_argument("--cost", type=float, default=100.0, help="brokerage+taxes estimate Rs per trade")
     ap.add_argument("--tp-first", action="store_true", help="same candle ma SL+Target banne aave to Target gano")
     ap.add_argument("--vix-csv"), ap.add_argument("--no-vix", action="store_true")
+    ap.add_argument("--strategy-only", "--spot-only", action="store_true", dest="strategy_only",
+                    help="option vagar fakt strategy report: Nifty spot par UP=long/DOWN=short, P&L points ma")
     ap.add_argument("--out", default=os.path.join(nb.DATA_DIR, "backtest_report"))
     a = ap.parse_args(argv)
 
@@ -586,6 +700,15 @@ def main(argv=None, in_bot=False):
     if not in_bot:
         nb.load_custom_strategies()
     cfg = build_cfg(a)
+    cfg["spot_only"], cfg["spot_sl"], cfg["spot_tp"] = a.strategy_only, None, None
+    UNIT["pts"] = a.strategy_only
+    if a.strategy_only:                      # SL/Target fakt points ma (Nifty spot points); na aapo to nahi
+        for nm, v in (("spot_sl", a.sl), ("spot_tp", a.tp)):
+            if v:
+                mode, val = parse_limit(v)
+                if mode != "points":
+                    raise SystemExit("--strategy-only ma --sl/--tp fakt points ma: jem ke --sl points:40")
+                cfg[nm] = val
     tfs = [int(x) for x in a.tf.split(",")]
     strats = list(nb.STRATEGIES) if a.strategy == "all" else a.strategy.split(",")
     for s in strats:
@@ -602,7 +725,7 @@ def main(argv=None, in_bot=False):
         df = load_spot(tf, a.days, a.spot_csv)
         days_set = set(df["time"].dt.date)
         first_day, last_day = min(days_set), max(days_set)
-        if not ivmap and not a.no_vix and (a.vix_csv or not a.spot_csv):
+        if not ivmap and not a.no_vix and not a.strategy_only and (a.vix_csv or not a.spot_csv):
             ivmap = load_vix(df, a.vix_csv)
             if ivmap:
                 notes = f"India VIX (previous close), fixed {a.iv:g}% jya VIX na hoy"
@@ -627,13 +750,15 @@ def main(argv=None, in_bot=False):
 
 def summary_text(results, last_day, first_day, avail):
     """Telegram mate short text summary."""
-    L = [f"📊 Backtest {first_day} → {last_day} (net, slippage+cost pachhi)"]
+    L = [f"📊 Backtest {first_day} → {last_day} " + ("(strategy-only, Nifty points)" if UNIT["pts"]
+                                                       else "(net, slippage+cost pachhi)")]
     for (s, tf), t in results.items():
         L += ["", f"{nb.STRATEGIES.get(s, {}).get('label', s)} • {tf}m"]
         for nm, d in avail:
             m = metrics(period_slice(t, last_day, d))
             L.append(f"• {nm}: {inr(m['net'])} | {m['trades']} trades | win {m['win']:.0f}% | DD {inr(m['mdd'])}")
-    L += ["", "⚠️ Option price Black-Scholes model thi - approximate."]
+    L += ["", "ℹ️ Strategy-only: Nifty points ma, option/cost vagar." if UNIT["pts"]
+          else "⚠️ Option price Black-Scholes model thi - approximate."]
     return "\n".join(L)
 
 
