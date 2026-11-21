@@ -1242,6 +1242,7 @@ def settings_hub():
             "Kai mode ni setting badalvi che? 👇\n(Banne ni setting alag save thay che)")
     kb = Markup([[Btn("📝 Paper settings", callback_data="cfg|paper|settings"),
                   Btn("⚡ Live settings", callback_data="cfg|live|settings")],
+                 [Btn("📊 Backtest", callback_data="bt_menu")],
                  [Btn("🏠 Menu", callback_data="menu")]])
     return text, kb
 
@@ -2803,6 +2804,7 @@ def main_menu_kb() -> Markup:
         [Btn("🚪 Exit Position", callback_data="exit")],
         [Btn("📝 Paper Mode", callback_data="mode_paper"), Btn("⚡ Live Mode", callback_data="mode_live")],
         [Btn("⚙️ Settings", callback_data="settings"), Btn("🧪 Angel Test", callback_data="angeltest")],
+        [Btn("📊 Backtest", callback_data="bt_menu")],
         [Btn("🔄 Refresh", callback_data="menu"), Btn("📒 Angel Orders", callback_data="angelorders")],
         [Btn("❓ Help", callback_data="help"), Btn("❌ Close", callback_data="close")],
     ])
@@ -3153,6 +3155,27 @@ async def on_button_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if d.startswith("cfg|") and d.split("|", 2)[2].startswith("sx_"):
             _, prof_x, inner_x = d.split("|", 2)
             return await _handle_sx(inner_x, f"cfg|{prof_x}|")
+        if d == "bt_menu":
+            await _ans(q)
+            return await show(backtest_text(), backtest_kb())
+        if d.startswith("bt_days_"):
+            BT_DAYS["v"] = int(d.split("_")[2])
+            await _ans(q, f"{BT_DAYS['v']} divas")
+            return await show(backtest_text(), backtest_kb())
+        if d.startswith("bt_run_"):
+            _, _, prof_bt, kind_bt = d.split("_")
+            if _bt_running["on"]:
+                return await _ans(q, "Backtest haju chalu che, puru thava do.", show_alert=True)
+            await _ans(q, "Backtest chalu ⏳")
+            st_bt = _with_profile(prof_bt, snapshot_settings)      # setting ni nakal; live bot ne aadvu nahi
+            days_bt, spot_bt = BT_DAYS["v"], kind_bt == "spot"
+            title_bt = (f"{'⚡ LIVE' if prof_bt == 'live' else '📝 PAPER'} setting mujab • "
+                        f"{'Strategy only (option vagar)' if spot_bt else 'Option sell spread'} • {days_bt} divas")
+            t_ = asyncio.create_task(_backtest_job(
+                q.message, lambda bt: bt.run_profile(st_bt, days_bt, spot_bt), title_bt))
+            _bt_tasks.add(t_)
+            t_.add_done_callback(_bt_tasks.discard)
+            return
         if d == "settings":
             await _ans(q)
             text_, kb_ = settings_hub()
@@ -3479,13 +3502,70 @@ async def cmd_signal(update: Update, ctx):
 
 
 _bt_running = {"on": False}
+BT_DAYS = {"v": 365}                  # backtest ketla divas no (button thi badlay)
+_bt_tasks = set()
+
+
+async def _backtest_job(msg, runner, title: str):
+    """runner(backtest_module) ne thread ma chalave, pachi summary + HTML report moklo."""
+    if _bt_running["on"]:
+        return await msg.reply_text("⏳ Backtest haju chalu che, puru thava do.")
+    _bt_running["on"] = True
+    await msg.reply_text(f"⏳ {title}\nBacktest chalu... (1-5 min lagse, bot normal chalse)")
+    # nifty_bot ne 'nifty_bot' naam thi j backtest ma import karva (same module, navi copy nahi)
+    sys.modules.setdefault("nifty_bot", sys.modules[__name__])
+
+    def work():
+        import backtest
+        return runner(backtest)
+    try:
+        path, summary = await asyncio.to_thread(work)
+        for part in _chunks(f"{title}\n\n{summary}"):
+            await msg.reply_text(part)
+        with open(path, "rb") as f:
+            data = f.read()
+        await msg.reply_document(document=data, filename="backtest_report.html",
+                                 caption="📄 Full report (browser ma kholo)",
+                                 reply_markup=Markup([[Btn("📊 Backtest menu", callback_data="bt_menu"),
+                                                       Btn("🏠 Menu", callback_data="menu_new")]]))
+    except Exception as e:
+        log.exception("backtest fail")
+        await msg.reply_text(f"⚠️ Backtest fail: {e}")
+    finally:
+        _bt_running["on"] = False
+
+
+def backtest_text() -> str:
+    def summ(prof):
+        def f():
+            return (f"{strategy_label()} {CANDLE_MINUTES}m • Lots {LOTS} • {sell_label(SELL_OFFSET)} • "
+                    f"Hedge {HEDGE_PCT * 100:.0f}% • SL {limit_short(SL_MODE, SL_VALUE)} • "
+                    f"TP {limit_short(TP_MODE, TP_VALUE)}")
+        return _with_profile(prof, f)
+    return (f"📊 Backtest report\n━━━━━━━━━━━━━━━━━━\n"
+            f"Saved strategy + setting mujab • last {BT_DAYS['v']} divas\n\n"
+            f"📝 PAPER: {summ('paper')}\n\n⚡ LIVE: {summ('live')}\n\n"
+            "• Option sell: spread (hedge, SL, target sathe) - option price model thi approximate\n"
+            "• Strategy only: option vagar, Nifty points ma (UP = long, DOWN = short)\n\n"
+            "Kaya profile no report joiye? 👇")
+
+
+def backtest_kb() -> Markup:
+    cur = BT_DAYS["v"]
+    return Markup([
+        [Btn("📝 Paper • Option sell", callback_data="bt_run_paper_opt"),
+         Btn("⚡ Live • Option sell", callback_data="bt_run_live_opt")],
+        [Btn("📝 Paper • Strategy only", callback_data="bt_run_paper_spot"),
+         Btn("⚡ Live • Strategy only", callback_data="bt_run_live_spot")],
+        [Btn(f"{'✅ ' if cur == n else ''}{n} divas", callback_data=f"bt_days_{n}") for n in (90, 180, 365)],
+        [Btn("⚙️ Settings", callback_data="settings"), Btn("🏠 Menu", callback_data="menu")],
+    ])
 
 
 async def cmd_backtest(update: Update, ctx):
     """/backtest [--strategy all] [--tf 3,5] [--days 180] [--sl pct:40] ...  (backtest.py ni options)"""
     if not authorized(update):
         return
-    import shlex
     args = list(ctx.args or [])
     is_help = any("help" in a.lower() or a == "?" for a in args)
     while args and not args[0].startswith("-"):      # '--' vagar na extra shabdo (jem ke 'report') ignore
@@ -3493,6 +3573,7 @@ async def cmd_backtest(update: Update, ctx):
     if is_help:
         return await update.message.reply_text(
             "📊 Backtest (aaj na bot settings mujab, option sell spread)\n\n"
+            "Button: /menu → 📊 Backtest (Paper / Live saved setting mujab)\n\n"
             "/backtest  → current strategy, 3 min, 365 divas\n"
             "/backtest --strategy all --tf 3,5\n"
             "/backtest --days 180 --sl pct:40 --tp pct:60\n"
@@ -3501,31 +3582,9 @@ async def cmd_backtest(update: Update, ctx):
             "/backtest --strategy-only --strategy all --tf 3,5 --sl points:40 --tp points:80\n\n"
             "Options: --strategy supertrend|ema|rsi_wma|<custom key>|all  --tf 1,3,5,10,15,30  --days N\n"
             "--sl/--tp pct:50|amount:2000|points:40  --lots --offset --hedge-pct --expiry w1|w2|m1\n"
-            "--slip 0.5  --cost 100  --iv 14  --no-vix")
-    if _bt_running["on"]:
-        return await update.message.reply_text("⏳ Backtest haju chalu che, puru thava do.")
-    _bt_running["on"] = True
-    await update.message.reply_text("⏳ Backtest chalu... (1-5 min lagse, bot normal chalse)")
-    # nifty_bot ne 'nifty_bot' naam thi j backtest ma import karva (same module, navi copy nahi)
-    sys.modules.setdefault("nifty_bot", sys.modules[__name__])
-
-    def work():
-        import backtest
-        return backtest.run_from_bot(args)
-    try:
-        path, summary = await asyncio.to_thread(work)
-        for part in _chunks(summary):
-            await update.message.reply_text(part)
-        with open(path, "rb") as f:
-            data = f.read()
-        await update.message.reply_document(document=data, filename="backtest_report.html",
-                                            caption="📄 Full report (browser ma kholo)")
-    except Exception as e:
-        log.exception("backtest fail")
-        await update.message.reply_text(f"⚠️ Backtest fail: {e}")
-    finally:
-        _bt_running["on"] = False
-
+            "--slip 0.5  --cost 100  --iv 14  --no-vix",
+            reply_markup=Markup([[Btn("📊 Backtest menu", callback_data="bt_menu")]]))
+    await _backtest_job(update.message, lambda bt: bt.run_from_bot(args), "Backtest (current setting)")
 
 
 async def cmd_help(update: Update, ctx):

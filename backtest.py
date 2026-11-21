@@ -668,7 +668,34 @@ class _AP(argparse.ArgumentParser):
         raise SystemExit(f"Argument error: {message}")
 
 
-def main(argv=None, in_bot=False):
+def cfg_from_settings(st):
+    """Bot na saved settings dict (snapshot_settings / PROFILES) -> backtest cfg. nb na globals ne aadvu nathi."""
+    def t(k, cur):
+        try:
+            return datetime.strptime(st[k], "%H:%M").time()
+        except Exception:
+            return cur
+    c = {"lots": int(st.get("LOTS", nb.LOTS)), "hedge_pct": float(st.get("HEDGE_PCT", nb.HEDGE_PCT)),
+         "offset": int(st.get("SELL_OFFSET", nb.SELL_OFFSET)),
+         "exit_on_flip": bool(st.get("EXIT_ON_FLIP", nb.EXIT_ON_FLIP)),
+         "entry_start": t("ENTRY_START", nb.ENTRY_START), "last_entry": t("LAST_ENTRY", nb.LAST_ENTRY),
+         "force_exit": t("FORCE_EXIT", nb.FORCE_EXIT),
+         "one_trade": bool(st.get("ONE_TRADE_PER_TREND", nb.ONE_TRADE_PER_TREND)),
+         "expiry_skip_today": bool(st.get("EXPIRY_SKIP_TODAY", nb.EXPIRY_SKIP_TODAY)),
+         "day_limit_on": bool(st.get("DAY_LIMIT_ON", nb.DAY_LIMIT_ON)),
+         "day_loss": float(st.get("DAY_LOSS_LIMIT", nb.DAY_LOSS_LIMIT)),
+         "day_profit": float(st.get("DAY_PROFIT_LIMIT", nb.DAY_PROFIT_LIMIT)),
+         "max_trades_on": bool(st.get("MAX_TRADES_ON", nb.MAX_TRADES_ON)),
+         "max_trades": int(st.get("MAX_TRADES_PER_DAY", nb.MAX_TRADES_PER_DAY))}
+    if st.get("SL_MODE") in nb.MODE_INFO and st.get("TP_MODE") in nb.MODE_INFO:
+        c.update(sl_mode=st["SL_MODE"], sl_val=float(st.get("SL_VALUE", nb.SL_VALUE)),
+                 tp_mode=st["TP_MODE"], tp_val=float(st.get("TP_VALUE", nb.TP_VALUE)))
+    if st.get("EXPIRY_MODE") in nb.EXPIRY_MODES:
+        c["expiry_mode"] = st["EXPIRY_MODE"]
+    return c
+
+
+def main(argv=None, in_bot=False, settings=None):
     ap = _AP(description="Nifty credit-spread backtest (nifty_bot.py rules)")
     ap.add_argument("--strategy", default=nb.DEFAULT_STRATEGY, help="key (supertrend/ema/rsi_wma/custom) | all | a,b")
     ap.add_argument("--tf", default=str(nb.CANDLE_MINUTES), help="candle minutes: 1,3,5,10,15,30 (comma = ghani)")
@@ -700,6 +727,8 @@ def main(argv=None, in_bot=False):
     if not in_bot:
         nb.load_custom_strategies()
     cfg = build_cfg(a)
+    if settings:                             # Telegram button: paper/live profile ni saved setting
+        cfg.update(cfg_from_settings(settings))
     cfg["spot_only"], cfg["spot_sl"], cfg["spot_tp"] = a.strategy_only, None, None
     UNIT["pts"] = a.strategy_only
     if a.strategy_only:                      # SL/Target fakt points ma (Nifty spot points); na aapo to nahi
@@ -760,6 +789,20 @@ def summary_text(results, last_day, first_day, avail):
     L += ["", "ℹ️ Strategy-only: Nifty points ma, option/cost vagar." if UNIT["pts"]
           else "⚠️ Option price Black-Scholes model thi - approximate."]
     return "\n".join(L)
+
+
+def run_profile(settings, days=365, strategy_only=False, spot_csv=None):
+    """Telegram button mate: saved profile settings (strategy + timeframe + badhu) mujab backtest."""
+    argv = ["--strategy", settings.get("strategy") or nb.DEFAULT_STRATEGY,
+            "--tf", str(settings.get("CANDLE_MINUTES", nb.CANDLE_MINUTES)), "--days", str(days)]
+    if strategy_only:
+        argv.append("--strategy-only")
+    if spot_csv:
+        argv += ["--spot-csv", spot_csv]
+    try:
+        return main(argv, in_bot=True, settings=settings)
+    except SystemExit as e:
+        raise RuntimeError(str(e.code))
 
 
 def run_from_bot(argv):
